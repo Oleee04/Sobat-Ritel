@@ -22,42 +22,34 @@
   ],
   "routes": [
     {
-      "comment": "Serve static assets (CSS, JS, images, fonts) directly from CDN",
       "src": "^/assets/(.*)$",
       "dest": "/assets/$1"
     },
     {
-      "comment": "Root URL - redirect to index.php (login page)",
       "src": "^/$",
       "dest": "/index.php"
     },
     {
-      "comment": "Allow direct .php file access with query strings (e.g. /dashboard.php?id=1)",
       "src": "^/(index|dashboard|scanner|screener|screener_results|technical|broker|bandarmology|calculators|news|settings|change_password|logout|register|auth)\\.php$",
       "dest": "/$1.php"
     },
     {
-      "comment": "Allow direct .php file access with query string parameters",
       "src": "^/(index|dashboard|scanner|screener|screener_results|technical|broker|bandarmology|calculators|news|settings|change_password|logout|register|auth)\\.php(\\?.*)?$",
       "dest": "/$1.php$2"
     },
     {
-      "comment": "API endpoints (JSON responses)",
       "src": "^/(api_price|api_screener|import_csv|sync_prices)\\.php(\\?.*)?$",
       "dest": "/$1.php$2"
     },
     {
-      "comment": "Clean URL routing - /dashboard -> dashboard.php",
       "src": "^/(dashboard|scanner|screener|screener_results|technical|broker|bandarmology|calculators|news|settings|change_password|logout|register|auth)(\\?.*)?$",
       "dest": "/$1.php$2"
     },
     {
-      "comment": "API clean URLs - /api_price -> api_price.php",
       "src": "^/(api_price|api_screener|import_csv|sync_prices)(\\?.*)?$",
       "dest": "/$1.php$2"
     },
     {
-      "comment": "Fallback - anything else goes to index.php (login page)",
       "src": "^/(.*)$",
       "dest": "/index.php"
     }
