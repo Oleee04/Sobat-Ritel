@@ -1,0 +1,6 @@
+{
+  "dependencies": {
+    "@mathieuc/tradingview": "^3.5.2",
+    "mysql2": "^3.22.3"
+  }
+}
