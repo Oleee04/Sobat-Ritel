@@ -3,17 +3,26 @@
 error_reporting(E_ALL & ~E_DEPRECATED & ~E_NOTICE & ~E_WARNING);
 ini_set('display_errors', '0');
 
-$host = $_ENV['DB_HOST'] ?? 'localhost';
-$user = $_ENV['DB_USER'] ?? 'root';
-$pass = $_ENV['DB_PASSWORD'] ?? ''; // Default laragon password
-$db = $_ENV['DB_NAME'] ?? 'screening_saham';
+// Use getenv() as primary for environment variables, which is more reliable in serverless environments like Vercel
+$host = getenv('DB_HOST') ?: ($_ENV['DB_HOST'] ?? 'localhost');
+$user = getenv('DB_USER') ?: ($_ENV['DB_USER'] ?? 'root');
+$pass = getenv('DB_PASSWORD') !== false ? getenv('DB_PASSWORD') : ($_ENV['DB_PASSWORD'] ?? '');
+$db = getenv('DB_NAME') ?: ($_ENV['DB_NAME'] ?? 'screening_saham');
+$port = getenv('DB_PORT') !== false ? (int)getenv('DB_PORT') : (isset($_ENV['DB_PORT']) ? (int)$_ENV['DB_PORT'] : 3306);
 
-$conn = new mysqli($host, $user, $pass, $db);
+// Disable strict error reporting temporarily for connection attempt to prevent uncaught mysqli_sql_exception crash
+$previous_reporting = mysqli_report(MYSQLI_REPORT_OFF);
+
+$conn = @new mysqli($host, $user, $pass, $db, $port);
+
+// Restore previous reporting mode
+if ($previous_reporting !== false) {
+    mysqli_report($previous_reporting);
+}
 
 if ($conn->connect_error) {
-    // If DB doesn't exist, we might be hitting this before importing. 
-    // Just a fallback check.
-    die("Connection failed: " . $conn->connect_error);
+    // Graceful error display instead of fatal crash
+    die("Database connection failed. Please check your environment variables in Vercel. Error: " . $conn->connect_error);
 }
 
 // Helper to fetch 100% accurate live stock price from Yahoo Finance API (matching TradingView)
