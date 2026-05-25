@@ -1,0 +1,1963 @@
+"""Bandarmology routes for stock screening and analysis."""
+from fastapi import APIRouter, Query, BackgroundTasks
+from fastapi.responses import JSONResponse
+from typing import Optional, List
+import logging
+import asyncio
+import copy
+import numpy as np
+
+router = APIRouter(prefix="/api", tags=["bandarmology"])
+
+logger = logging.getLogger(__name__)
+
+# Track active deep analysis tasks
+_deep_analysis_status = {
+    "running": False,
+    "progress": 0,
+    "total": 0,
+    "requested": 0,
+    "qualified": 0,
+    "processed": 0,
+    "failed": 0,
+    "already_fresh_today": 0,
+    "current_ticker": "",
+    "active_tickers": [],
+    "completed_tickers": [],
+    "failed_tickers": [],
+    "fresh_tickers": [],
+    "errors": [],
+    "retry_policy": {"delay_seconds": 120, "max_attempts": 10},
+    "retrying_items": [],
+    "retry_waiting_count": 0,
+    "non_retryable_skips": [],
+    "retry_exhausted": [],
+    "broksum_fetch_stats": {
+        "success": 0,
+        "retried_success": 0,
+        "non_retryable": 0,
+        "exhausted": 0,
+    },
+    "profile": "balanced"
+}
+_deep_analysis_status_lock = asyncio.Lock()
+
+
+def _build_deep_analysis_status(
+    total: int,
+    requested: int,
+    qualified: int,
+    analysis_date: str,
+    concurrency: int,
+    profile: str,
+) -> dict:
+    return {
+        "running": True,
+        "progress": 0,
+        "total": total,
+        "requested": requested,
+        "qualified": qualified,
+        "processed": 0,
+        "failed": 0,
+        "already_fresh_today": 0,
+        "current_ticker": "",
+        "active_tickers": [],
+        "completed_tickers": [],
+        "failed_tickers": [],
+        "fresh_tickers": [],
+        "errors": [],
+        "retry_policy": {"delay_seconds": 120, "max_attempts": 10},
+        "retrying_items": [],
+        "retry_waiting_count": 0,
+        "non_retryable_skips": [],
+        "retry_exhausted": [],
+        "broksum_fetch_stats": {
+            "success": 0,
+            "retried_success": 0,
+            "non_retryable": 0,
+            "exhausted": 0,
+        },
+        "date": analysis_date,
+        "concurrency": concurrency,
+        "profile": profile,
+    }
+
+
+def sanitize_data(data):
+    """Recursively sanitize data to replace NaN/Inf values with None for JSON compliance."""
+    if isinstance(data, dict):
+        return {k: sanitize_data(v) for k, v in data.items()}
+    elif isinstance(data, list):
+        return [sanitize_data(item) for item in data]
+    elif isinstance(data, float):
+        if np.isnan(data) or np.isinf(data):
+            return None
+        return data
+    return data
+
+
+def _create_minimal_result_from_deep(ticker: str, deep_data: dict, analysis_date: str) -> dict:
+    """
+    Create a minimal base result entry for a ticker that has deep cache data
+    but isn't in the base screening results (e.g., manually deep-analyzed ticker).
+    """
+    # Get price from deep data if available
+    entry_price = deep_data.get('entry_price', 0)
+    target_price = deep_data.get('target_price', 0)
+    stop_loss = deep_data.get('stop_loss', 0)
+
+    # Use average buy price as current price proxy if entry price not available
+    price = entry_price or deep_data.get('broksum_avg_buy_price', 0)
+
+    # Calculate base score from deep data components (simplified)
+    # Deep score already has the comprehensive analysis
+    deep_score = deep_data.get('deep_score', 0)
+
+    # Base score is derived from available deep metrics
+    base_score = min(30, deep_score // 3)  # Conservative estimate
+
+    # Determine confluence status from deep data
+    txn_mm_cum = deep_data.get('txn_mm_cum', 0)
+    txn_foreign_cum = deep_data.get('txn_foreign_cum', 0)
+    txn_institution_cum = deep_data.get('txn_institution_cum', 0)
+
+    # Build positive methods list for confluence display
+    positive_methods = []
+    if txn_mm_cum > 0:
+        positive_methods.append('MM')
+    if txn_foreign_cum > 0:
+        positive_methods.append('FF')
+    if txn_institution_cum > 0:
+        positive_methods.append('INST')
+
+    # Determine confluence status
+    if len(positive_methods) >= 3:
+        confluence_status = 'TRIPLE'
+    elif len(positive_methods) == 2:
+        confluence_status = 'DOUBLE'
+    elif len(positive_methods) == 1:
+        confluence_status = 'SINGLE'
+    else:
+        confluence_status = 'NONE'
+
+    # Get top buyer/seller from deep data if available
+    top_buyers = deep_data.get('broksum_top_buyers', [])
+    top_sellers = deep_data.get('broksum_top_sellers', [])
+    top_buyer = top_buyers[0].get('code', '') if top_buyers else ''
+    top_seller = top_sellers[0].get('code', '') if top_sellers else ''
+
+    # Build minimal result structure matching the expected format
+    result = {
+        'symbol': ticker.upper(),
+        'name': ticker.upper(),  # Will display ticker as name
+        'price': price,
+        'pct_1d': 0,  # Not available for non-screened tickers
+        'total_score': base_score,
+        'max_score': 100,
+        'trade_type': deep_data.get('deep_trade_type', 'WATCH'),
+        'ma_above_count': 0,
+        'scores': {
+            'price_position': 0,
+            'flow_alignment': 0,
+            'confluence': 0,
+            'broker_activity': 0,
+            'momentum': 0,
+        },
+        'confluence_status': confluence_status,
+        'positive_methods': positive_methods,  # Required for confluence tooltip
+        'pinky': False,
+        'crossing': False,
+        'unusual': False,
+        'likuid': False,
+        'flags_detail': {},
+        # Weekly/daily flows - not available from base screening
+        'w_4': 0, 'w_3': 0, 'w_2': 0, 'w_1': 0,
+        'd_0_mm': 0, 'd_0_nr': 0, 'd_0_ff': 0,
+
+        # Broker summary fields (for table display)
+        'inst_net_lot': deep_data.get('broksum_net_institutional', 0),
+        'foreign_net_lot': deep_data.get('broksum_net_foreign', 0),
+        'top_buyer': top_buyer,
+        'top_seller': top_seller,
+
+        # Deep analysis fields
+        'has_deep': True,
+        'deep_score': deep_score,
+        'combined_score': base_score + deep_score,
+        'max_combined_score': 250,
+        'deep_trade_type': deep_data.get('deep_trade_type', '—'),
+        'deep_signals': deep_data.get('deep_signals', {}),
+
+        # Inventory
+        'inv_accum_brokers': deep_data.get('inv_accum_brokers', 0),
+        'inv_distrib_brokers': deep_data.get('inv_distrib_brokers', 0),
+        'inv_clean_brokers': deep_data.get('inv_clean_brokers', 0),
+        'inv_tektok_brokers': deep_data.get('inv_tektok_brokers', 0),
+        'inv_total_accum_lot': deep_data.get('inv_total_accum_lot', 0),
+        'inv_top_accum_broker': deep_data.get('inv_top_accum_broker', ''),
+
+        # Transaction chart
+        'txn_mm_cum': txn_mm_cum,
+        'txn_foreign_cum': txn_foreign_cum,
+        'txn_institution_cum': txn_institution_cum,
+        'txn_cross_index': deep_data.get('txn_cross_index', 0),
+        'txn_mm_trend': deep_data.get('txn_mm_trend', ''),
+        'txn_foreign_trend': deep_data.get('txn_foreign_trend', ''),
+
+        # Broker summary
+        'broksum_avg_buy_price': deep_data.get('broksum_avg_buy_price', 0),
+        'broksum_avg_sell_price': deep_data.get('broksum_avg_sell_price', 0),
+        'broksum_floor_price': deep_data.get('broksum_floor_price', 0),
+        'broksum_total_buy_lot': deep_data.get('broksum_total_buy_lot', 0),
+        'broksum_total_sell_lot': deep_data.get('broksum_total_sell_lot', 0),
+        'broksum_net_institutional': deep_data.get('broksum_net_institutional', 0),
+        'broksum_net_foreign': deep_data.get('broksum_net_foreign', 0),
+        'broksum_top_buyers': top_buyers,
+        'broksum_top_sellers': top_sellers,
+
+        # Entry/target
+        'entry_price': entry_price,
+        'target_price': target_price,
+        'stop_loss': stop_loss,
+        'risk_reward_ratio': deep_data.get('risk_reward_ratio', 0),
+
+        # Controlling broker
+        'controlling_brokers': deep_data.get('controlling_brokers', []),
+        'accum_phase': deep_data.get('accum_phase', 'UNKNOWN'),
+        'bandar_avg_cost': deep_data.get('bandar_avg_cost', 0),
+        'coordination_score': deep_data.get('coordination_score', 0),
+        'phase_confidence': deep_data.get('phase_confidence', 'LOW'),
+        'breakout_signal': deep_data.get('breakout_signal', 'NONE'),
+        'breakout_probability': deep_data.get('breakout_probability', 0),
+
+        # Other deep fields
+        'accum_duration_days': deep_data.get('accum_duration_days', 0),
+        'concentration_broker': deep_data.get('concentration_broker'),
+        'concentration_pct': deep_data.get('concentration_pct', 0),
+        'concentration_risk': deep_data.get('concentration_risk', 'NONE'),
+        'bandar_confirmation': deep_data.get('bandar_confirmation', 'NONE'),
+        'broksum_consistency_score': deep_data.get('broksum_consistency_score', 0),
+        'ma_cross_signal': deep_data.get('ma_cross_signal', 'NONE'),
+        'phase_transition': deep_data.get('phase_transition', 'NONE'),
+        'score_trend': deep_data.get('score_trend', 'NONE'),
+        'pump_tomorrow_score': deep_data.get('pump_tomorrow_score', 0),
+        'pump_tomorrow_signal': deep_data.get('pump_tomorrow_signal', 'NONE'),
+
+        # Volume confirmation (Improvement 2)
+        'volume_confirmation_multiplier': deep_data.get('volume_confirmation_multiplier', 0),
+
+        # Data freshness (Improvement 7)
+        'data_freshness': deep_data.get('data_freshness', 1.0),
+        'data_source_date': deep_data.get('data_source_date', ''),
+        'original_deep_score': deep_data.get('original_deep_score', 0),
+
+        # Target/stop method (Improvement 6)
+        'target_method': deep_data.get('target_method', ''),
+        'stop_method': deep_data.get('stop_method', ''),
+
+        # Relative context (Improvement 4)
+        'relative_context': deep_data.get('relative_context', {}),
+
+        # Conflict warning (Improvement 5)
+        'conflict_stats': deep_data.get('conflict_stats', None),
+        'data_source_conflict': deep_data.get('data_source_conflict', False),
+    }
+
+    return result
+
+
+@router.get("/bandarmology")
+async def get_bandarmology_screening(
+    date: Optional[str] = Query(None, description="Analysis date (YYYY-MM-DD). None = latest."),
+    min_score: int = Query(0, ge=0, le=100, description="Minimum score filter"),
+    trade_type: Optional[str] = Query(None, description="Filter by trade type: SWING, INTRADAY, BOTH, WATCH"),
+    profile: str = Query("balanced", description="Scoring profile: balanced|swing|daytrade"),
+    include_deep: bool = Query(True, description="Include deep analysis data if available"),
+    include_yahoo_finance: bool = Query(True, description="Include Yahoo Finance enhanced data")
+):
+    """
+    Get bandarmology screening results with optional deep analysis enrichment.
+    """
+    try:
+        from modules.bandarmology_analyzer import BandarmologyAnalyzer
+        from db.bandarmology_repository import BandarmologyRepository
+
+        analyzer = BandarmologyAnalyzer()
+        results = analyzer.analyze(target_date=date, profile=profile)
+
+        # Resolve date for response
+        actual_date = analyzer._resolve_date(date)
+
+        # Enrich with deep analysis data if available
+        deep_cache = {}
+        if include_deep and actual_date:
+            try:
+                band_repo = BandarmologyRepository()
+                deep_cache = band_repo.get_deep_cache_batch(actual_date)
+                if deep_cache:
+                    # First enrich existing results
+                    results = analyzer.enrich_results_with_deep(results, deep_cache)
+
+                    # Add tickers that have deep cache but aren't in base results
+                    # (e.g., manually deep-analyzed tickers)
+                    base_symbols = {r['symbol'] for r in results}
+                    for ticker, deep_data in deep_cache.items():
+                        if ticker not in base_symbols:
+                            # Create minimal base result for this ticker
+                            minimal_result = _create_minimal_result_from_deep(ticker, deep_data, actual_date)
+                            results.append(minimal_result)
+
+                    # Re-sort to include new entries
+                    results.sort(key=lambda x: x.get('combined_score', x.get('total_score', 0)), reverse=True)
+            except Exception as e:
+                logger.warning(f"Failed to load deep cache: {e}")
+
+        # Apply filters
+        if min_score > 0:
+            score_key = 'combined_score' if include_deep else 'total_score'
+            results = [r for r in results if r.get(score_key, r.get('total_score', 0)) >= min_score]
+
+        if trade_type:
+            trade_type_upper = trade_type.upper()
+            if trade_type_upper == "BOTH":
+                results = [r for r in results if r['trade_type'] == "BOTH"]
+            elif trade_type_upper == "SWING":
+                results = [r for r in results if r['trade_type'] in ("SWING", "BOTH")]
+            elif trade_type_upper == "INTRADAY":
+                results = [r for r in results if r['trade_type'] in ("INTRADAY", "BOTH")]
+            elif trade_type_upper == "WATCH":
+                results = [r for r in results if r['trade_type'] == "WATCH"]
+
+        # Enrich with Yahoo Finance data if requested
+        if include_yahoo_finance:
+            try:
+                from modules.bandarmology_screening_enhanced import get_screening_enhanced
+                screening_enhanced = get_screening_enhanced()
+                results = screening_enhanced.get_screening_with_yahoo_finance(results, include_yahoo=True)
+            except Exception as e:
+                logger.warning(f"Failed to load Yahoo Finance data: {e}")
+
+        return sanitize_data({
+            "profile": profile,
+            "date": actual_date,
+            "total_stocks": len(results),
+            "has_deep_data": any(r.get('deep_score', 0) > 0 for r in results),
+            "deep_analysis_running": _deep_analysis_status["running"],
+            "data": results
+        })
+
+    except Exception as e:
+        logger.error(f"Bandarmology screening error: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)}
+        )
+
+
+@router.get("/bandarmology/dates")
+async def get_bandarmology_dates():
+    """Get available dates for bandarmology analysis."""
+    try:
+        from modules.bandarmology_analyzer import BandarmologyAnalyzer
+
+        analyzer = BandarmologyAnalyzer()
+        dates = analyzer.get_available_dates()
+
+        return {"dates": dates}
+
+    except Exception as e:
+        logger.error(f"Bandarmology dates error: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)}
+        )
+
+
+@router.post("/bandarmology/deep-analyze")
+async def trigger_deep_analysis(
+    background_tasks: BackgroundTasks,
+    date: Optional[str] = Query(None, description="Analysis date"),
+    top_n: int = Query(30, ge=5, le=500, description="Number of top stocks to deep analyze"),
+    min_base_score: int = Query(20, ge=0, description="Minimum base score to qualify for deep analysis"),
+    concurrency: int = Query(4, ge=1, le=12, description="Parallel ticker workers for deep analysis"),
+    force: bool = Query(False, description="Force re-analysis even if cache exists"),
+    profile: str = Query("balanced", description="Scoring profile: balanced|swing|daytrade")
+):
+    """
+    Trigger deep analysis (inventory + transaction chart scraping) for top N stocks.
+    
+    This runs as a background task. Poll /bandarmology/deep-status for progress.
+    """
+    async with _deep_analysis_status_lock:
+        if _deep_analysis_status["running"]:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": "Deep analysis already running",
+                    "status": copy.deepcopy(_deep_analysis_status)
+                }
+            )
+
+    try:
+        from modules.bandarmology_analyzer import BandarmologyAnalyzer
+
+        analyzer = BandarmologyAnalyzer()
+        results = analyzer.analyze(target_date=date, profile=profile)
+        actual_date = analyzer._resolve_date(date)
+
+        # Get top N candidates
+        candidates = [r for r in results if r['total_score'] >= min_base_score]
+        qualified_count = len(candidates)
+        tickers = [r['symbol'] for r in candidates[:top_n]]
+
+        if not tickers:
+            return {"message": "No stocks qualify for deep analysis", "tickers": []}
+
+        # Reset status atomically (re-check running to avoid TOCTOU race)
+        async with _deep_analysis_status_lock:
+            if _deep_analysis_status["running"]:
+                return JSONResponse(
+                    status_code=409,
+                    content={
+                        "error": "Deep analysis already running",
+                        "status": copy.deepcopy(_deep_analysis_status)
+                    }
+                )
+
+            _deep_analysis_status.clear()
+            _deep_analysis_status.update(
+                _build_deep_analysis_status(
+                    total=len(tickers),
+                    requested=top_n,
+                    qualified=qualified_count,
+                    analysis_date=actual_date,
+                    concurrency=concurrency,
+                    profile=profile,
+                )
+            )
+
+        # Launch background task
+        background_tasks.add_task(
+            _run_deep_analysis,
+            tickers, actual_date, results, concurrency, force
+        )
+
+        return {
+            "message": f"Deep analysis started for {len(tickers)} stocks",
+            "tickers": tickers,
+            "date": actual_date,
+            "requested": top_n,
+            "qualified": qualified_count,
+            "to_process": len(tickers),
+            "concurrency": concurrency,
+            "profile": profile
+        }
+
+    except Exception as e:
+        logger.error(f"Failed to start deep analysis: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)}
+        )
+
+
+@router.post("/bandarmology/deep-analyze-tickers")
+async def trigger_deep_analysis_tickers(
+    background_tasks: BackgroundTasks,
+    tickers: str = Query(..., description="Comma-separated ticker symbols to deep analyze"),
+    date: Optional[str] = Query(None, description="Analysis date"),
+    concurrency: int = Query(4, ge=1, le=12, description="Parallel ticker workers for deep analysis"),
+    force: bool = Query(False, description="Force re-analysis even if cache exists"),
+    profile: str = Query("balanced", description="Scoring profile: balanced|swing|daytrade")
+):
+    """
+    Trigger deep analysis for specific tickers (manual input).
+    Accepts comma-separated ticker symbols, e.g. ?tickers=BBCA,BMRI,TLKM
+    """
+    async with _deep_analysis_status_lock:
+        if _deep_analysis_status["running"]:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": "Deep analysis already running",
+                    "status": copy.deepcopy(_deep_analysis_status)
+                }
+            )
+
+    try:
+        from modules.bandarmology_analyzer import BandarmologyAnalyzer
+
+        analyzer = BandarmologyAnalyzer()
+        actual_date = analyzer._resolve_date(date)
+        results = analyzer.analyze(target_date=actual_date, profile=profile)
+
+        # Parse tickers
+        ticker_list = [t.strip().upper() for t in tickers.split(",") if t.strip()]
+        if not ticker_list:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "No valid tickers provided"}
+            )
+
+        # Reset status atomically (re-check running to avoid TOCTOU race)
+        async with _deep_analysis_status_lock:
+            if _deep_analysis_status["running"]:
+                return JSONResponse(
+                    status_code=409,
+                    content={
+                        "error": "Deep analysis already running",
+                        "status": copy.deepcopy(_deep_analysis_status)
+                    }
+                )
+
+            _deep_analysis_status.clear()
+            _deep_analysis_status.update(
+                _build_deep_analysis_status(
+                    total=len(ticker_list),
+                    requested=len(ticker_list),
+                    qualified=len(ticker_list),
+                    analysis_date=actual_date,
+                    concurrency=concurrency,
+                    profile=profile,
+                )
+            )
+
+        background_tasks.add_task(
+            _run_deep_analysis,
+            ticker_list, actual_date, results, concurrency, force
+        )
+
+        return {
+            "message": f"Deep analysis started for {len(ticker_list)} ticker(s)",
+            "tickers": ticker_list,
+            "date": actual_date,
+            "requested": len(ticker_list),
+            "qualified": len(ticker_list),
+            "to_process": len(ticker_list),
+            "concurrency": concurrency,
+            "profile": profile
+        }
+
+    except Exception as e:
+        logger.error(f"Failed to start manual deep analysis: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)}
+        )
+
+
+@router.get("/bandarmology/deep-status")
+async def get_deep_analysis_status():
+    """Get the status of the running deep analysis task."""
+    async with _deep_analysis_status_lock:
+        return copy.deepcopy(_deep_analysis_status)
+
+
+def _classify_broksum_outcome(raw_result, error, context) -> str:
+    """Classify broker summary fetch outcome for retry policy."""
+    context = context or {}
+
+    if isinstance(raw_result, dict):
+        buy = raw_result.get("buy") or []
+        sell = raw_result.get("sell") or []
+        if buy or sell:
+            return "success"
+
+    reason = str(context.get("reason") or "").lower()
+    source = str(context.get("source") or "").lower()
+    if reason in {"no_data", "invalid_ticker", "invalid_date", "invalid_context"}:
+        return "non_retryable"
+    if source in {"explicit_no_data"}:
+        return "non_retryable"
+
+    text = " ".join([
+        str(error or ""),
+        str(context.get("status") or ""),
+        str(context.get("error") or ""),
+        str(context.get("message") or ""),
+    ]).lower()
+
+    retryable_markers = (
+        "429",
+        "too many requests",
+        "cooldown",
+        "timeout",
+        "timed out",
+        "connection",
+        "network",
+        "tempor",
+        "transient",
+    )
+    if any(marker in text for marker in retryable_markers):
+        return "retryable"
+
+    return "non_retryable"
+
+
+async def _fetch_broksum_with_deferred_retry(fetch_fn, ticker, date_str, status, status_lock=None):
+    """Fetch broker summary with fixed deferred retry policy."""
+    delay_seconds = 120
+    max_attempts = 10
+
+    if status is None:
+        status = {}
+
+    async def _mutate_status(mutator):
+        if status_lock:
+            async with status_lock:
+                mutator(status)
+        else:
+            mutator(status)
+
+    def _upsert_retrying_item(s, attempt):
+        retrying = s.setdefault("retrying_items", [])
+        updated = False
+        for item in retrying:
+            if item.get("ticker") == ticker and item.get("date") == date_str:
+                item["attempt"] = attempt
+                item["max_attempts"] = max_attempts
+                item["delay_seconds"] = delay_seconds
+                updated = True
+                break
+        if not updated:
+            retrying.append({
+                "ticker": ticker,
+                "date": date_str,
+                "attempt": attempt,
+                "max_attempts": max_attempts,
+                "delay_seconds": delay_seconds,
+            })
+        s["retry_waiting_count"] = len(retrying)
+
+    def _remove_retrying_item(s):
+        retrying = s.setdefault("retrying_items", [])
+        s["retrying_items"] = [
+            item for item in retrying
+            if not (item.get("ticker") == ticker and item.get("date") == date_str)
+        ]
+        s["retry_waiting_count"] = len(s["retrying_items"])
+
+    for attempt in range(1, max_attempts + 1):
+        raw_result = None
+        error = None
+        context = {}
+
+        try:
+            fetch_result = await fetch_fn(ticker, date_str)
+            if isinstance(fetch_result, tuple):
+                if len(fetch_result) >= 3:
+                    raw_result, error, context = fetch_result[0], fetch_result[1], fetch_result[2]
+                elif len(fetch_result) == 2:
+                    raw_result, error = fetch_result
+                elif len(fetch_result) == 1:
+                    raw_result = fetch_result[0]
+                else:
+                    raw_result = None
+            else:
+                raw_result = fetch_result
+        except Exception as fetch_exc:
+            raw_result = None
+            error = fetch_exc
+            context = {}
+
+        context = context if isinstance(context, dict) else {}
+        outcome = _classify_broksum_outcome(raw_result, error, context)
+
+        if outcome == "success":
+            def _on_success(s):
+                _remove_retrying_item(s)
+                stats = s.setdefault("broksum_fetch_stats", {})
+                key = "success" if attempt == 1 else "retried_success"
+                stats[key] = stats.get(key, 0) + 1
+            await _mutate_status(_on_success)
+            return raw_result
+
+        if outcome == "non_retryable":
+            def _on_non_retryable(s):
+                _remove_retrying_item(s)
+                s.setdefault("non_retryable_skips", []).append({
+                    "ticker": ticker,
+                    "date": date_str,
+                    "attempt": attempt,
+                    "reason": str(error or context.get("reason") or "non_retryable"),
+                })
+                stats = s.setdefault("broksum_fetch_stats", {})
+                stats["non_retryable"] = stats.get("non_retryable", 0) + 1
+            await _mutate_status(_on_non_retryable)
+            return None
+
+        if attempt >= max_attempts:
+            def _on_exhausted(s):
+                _remove_retrying_item(s)
+                s.setdefault("retry_exhausted", []).append({
+                    "ticker": ticker,
+                    "date": date_str,
+                    "attempts": attempt,
+                })
+                stats = s.setdefault("broksum_fetch_stats", {})
+                stats["exhausted"] = stats.get("exhausted", 0) + 1
+            await _mutate_status(_on_exhausted)
+            return None
+
+        await _mutate_status(lambda s: _upsert_retrying_item(s, attempt))
+        await asyncio.sleep(delay_seconds)
+
+    return None
+
+
+async def _run_deep_analysis(tickers: list, analysis_date: str, base_results: list, concurrency: int = 4, force: bool = False):
+    """Background task: scrape inventory + txn chart and run deep scoring."""
+    logger.info(f"_run_deep_analysis started: {len(tickers)} tickers, force={force}")
+    from modules.neobdm_api_client import NeoBDMApiClient
+    from modules.bandarmology_analyzer import BandarmologyAnalyzer
+    from db.bandarmology_repository import BandarmologyRepository
+
+    band_repo = BandarmologyRepository()
+    analyzer = BandarmologyAnalyzer()
+
+    # Build lookup for base results
+    base_lookup = {r['symbol']: r for r in base_results}
+
+    api_client = NeoBDMApiClient()
+    status_lock = _deep_analysis_status_lock
+    db_write_lock = asyncio.Lock()
+    # Global rate limiter: only 1 broker summary API call at a time to avoid 429
+    broksum_rate_limiter = asyncio.Semaphore(1)
+    try:
+        login_ok = await api_client.login()
+        if not login_ok:
+            async with status_lock:
+                _deep_analysis_status["running"] = False
+                _deep_analysis_status["errors"].append("Login failed")
+            return
+
+        from db.neobdm_repository import NeoBDMRepository
+        neobdm_repo = NeoBDMRepository()
+
+        # Skip tickers that already have deep cache for analysis_date (unless force=True)
+        fresh_tickers = []
+        tickers_to_process = []
+
+        if force:
+            # Force mode: delete existing cache entries and process all tickers
+            deleted_count = 0
+            for ticker in tickers:
+                deleted = band_repo.delete_deep_cache(ticker, analysis_date)
+                if deleted:
+                    deleted_count += 1
+                    logger.info(f"Force mode: deleted cache for {ticker} on {analysis_date}")
+            tickers_to_process = tickers
+            logger.info(f"Force mode: cleared cache for {deleted_count}/{len(tickers)} tickers, all will be re-analyzed")
+        else:
+            # Normal mode: skip tickers that already have fresh cache
+            for ticker in tickers:
+                existing = band_repo.get_deep_cache(ticker, analysis_date)
+                if existing:
+                    fresh_tickers.append(ticker)
+                    logger.debug(f"Skipping {ticker} - already has fresh cache for {analysis_date}")
+                else:
+                    tickers_to_process.append(ticker)
+
+        async with status_lock:
+            _deep_analysis_status["fresh_tickers"] = fresh_tickers
+            _deep_analysis_status["already_fresh_today"] = len(fresh_tickers)
+            _deep_analysis_status["total"] = len(tickers_to_process)
+            _deep_analysis_status["progress"] = 0
+            _deep_analysis_status["processed"] = 0
+            _deep_analysis_status["failed"] = 0
+            logger.info(f"Status updated: total={len(tickers_to_process)}, fresh={len(fresh_tickers)}, force={force}")
+
+        if not tickers_to_process:
+            logger.info("Deep analysis skipped: all requested tickers already fresh for today")
+            return
+
+        semaphore = asyncio.Semaphore(max(1, int(concurrency)))
+
+        async def _process_ticker(ticker: str):
+            async with semaphore:
+                async with status_lock:
+                    _deep_analysis_status["current_ticker"] = ticker
+                    _deep_analysis_status["active_tickers"].append(ticker)
+
+                try:
+                    # 1. Fetch Inventory + Transaction Chart via API (concurrent)
+                    inv_data = None
+                    price_series = None
+                    raw_inv = None
+                    txn_data = None
+                    inv_task = asyncio.create_task(api_client.get_inventory(ticker))
+                    txn_task = asyncio.create_task(api_client.get_transaction_chart(ticker))
+                    inv_result, txn_result = await asyncio.gather(inv_task, txn_task, return_exceptions=True)
+
+                    if isinstance(inv_result, Exception):
+                        logger.warning(f"Inventory API failed for {ticker}: {inv_result}")
+                        async with status_lock:
+                            _deep_analysis_status["errors"].append(f"{ticker} inv: {str(inv_result)[:80]}")
+                    else:
+                        raw_inv = inv_result
+                        if raw_inv and raw_inv.get('brokers'):
+                            async with db_write_lock:
+                                await asyncio.to_thread(
+                                    band_repo.save_inventory_batch,
+                                    ticker,
+                                    raw_inv['brokers'],
+                                    raw_inv.get('firstDate', ''),
+                                    raw_inv.get('lastDate', '')
+                                )
+                            inv_data = raw_inv['brokers']
+                            price_series = raw_inv.get('priceSeries')
+
+                    if isinstance(txn_result, Exception):
+                        logger.warning(f"Txn chart API failed for {ticker}: {txn_result}")
+                        async with status_lock:
+                            _deep_analysis_status["errors"].append(f"{ticker} txn: {str(txn_result)[:80]}")
+                    else:
+                        raw_txn = txn_result
+                        if raw_txn:
+                            async with db_write_lock:
+                                await asyncio.to_thread(band_repo.save_transaction_chart, ticker, raw_txn)
+                            txn_data = await asyncio.to_thread(band_repo.get_transaction_chart, ticker)
+
+                    # 3. Fetch Broker Summary via API (prefer latest available)
+                    broksum_data = None
+                    broksum_used_date = analysis_date
+                    try:
+                        from datetime import datetime as dt, timedelta
+                        if analysis_date:
+                            analysis_dt = dt.strptime(analysis_date, '%Y-%m-%d').date()
+                            today = dt.now().date()
+                            if today > analysis_dt:
+                                max_forward_days = min(5, (today - analysis_dt).days)
+                                candidate_dates = []
+                                for offset in range(0, max_forward_days + 1):
+                                    d = today - timedelta(days=offset)
+                                    if d.weekday() >= 5:
+                                        continue
+                                    if d <= analysis_dt:
+                                        continue
+                                    candidate_dates.append(d.strftime('%Y-%m-%d'))
+
+                                for dstr in candidate_dates:
+                                    existing_latest = await asyncio.to_thread(
+                                        neobdm_repo.get_broker_summary, ticker, dstr
+                                    )
+                                    if existing_latest and (existing_latest.get('buy') or existing_latest.get('sell')):
+                                        broksum_data = existing_latest
+                                        broksum_used_date = dstr
+                                        break
+                                    async def _fetch_latest_with_limiter(fetch_ticker, fetch_date):
+                                        try:
+                                            async with broksum_rate_limiter:
+                                                raw = await api_client.get_broker_summary(
+                                                    fetch_ticker, fetch_date, fast_fail=True
+                                                )
+                                            return raw, None, {
+                                                "ticker": fetch_ticker,
+                                                "date": fetch_date,
+                                                "source": "latest_forward_lookup",
+                                            }
+                                        except Exception as fetch_exc:
+                                            return None, fetch_exc, {
+                                                "ticker": fetch_ticker,
+                                                "date": fetch_date,
+                                                "source": "latest_forward_lookup",
+                                            }
+
+                                    raw_latest = await _fetch_broksum_with_deferred_retry(
+                                        fetch_fn=_fetch_latest_with_limiter,
+                                        ticker=ticker,
+                                        date_str=dstr,
+                                        status=_deep_analysis_status,
+                                        status_lock=status_lock,
+                                    )
+                                    if raw_latest and (raw_latest.get('buy') or raw_latest.get('sell')):
+                                        async with db_write_lock:
+                                            await asyncio.to_thread(
+                                                neobdm_repo.save_broker_summary_batch,
+                                                ticker, dstr,
+                                                raw_latest.get('buy', []),
+                                                raw_latest.get('sell', [])
+                                            )
+                                        broksum_data = raw_latest
+                                        broksum_used_date = dstr
+                                        break
+                    except Exception as e:
+                        logger.warning(f"Latest broksum lookup failed for {ticker}: {e}")
+                    if broksum_data is None and analysis_date:
+                        try:
+                            async def _fetch_analysis_date_with_limiter(fetch_ticker, fetch_date):
+                                try:
+                                    async with broksum_rate_limiter:
+                                        raw = await api_client.get_broker_summary(
+                                            fetch_ticker, fetch_date, fast_fail=True
+                                        )
+                                    return raw, None, {
+                                        "ticker": fetch_ticker,
+                                        "date": fetch_date,
+                                        "source": "analysis_date",
+                                    }
+                                except Exception as fetch_exc:
+                                    return None, fetch_exc, {
+                                        "ticker": fetch_ticker,
+                                        "date": fetch_date,
+                                        "source": "analysis_date",
+                                    }
+
+                            raw_broksum = await _fetch_broksum_with_deferred_retry(
+                                fetch_fn=_fetch_analysis_date_with_limiter,
+                                ticker=ticker,
+                                date_str=analysis_date,
+                                status=_deep_analysis_status,
+                                status_lock=status_lock,
+                            )
+                            if raw_broksum:
+                                async with db_write_lock:
+                                    await asyncio.to_thread(
+                                        neobdm_repo.save_broker_summary_batch,
+                                        ticker, analysis_date,
+                                        raw_broksum.get('buy', []),
+                                        raw_broksum.get('sell', [])
+                                    )
+                                broksum_data = raw_broksum
+                                broksum_used_date = analysis_date
+                            else:
+                                existing = await asyncio.to_thread(
+                                    neobdm_repo.get_broker_summary, ticker, analysis_date
+                                )
+                                if existing and (existing.get('buy') or existing.get('sell')):
+                                    broksum_data = existing
+                                    broksum_used_date = analysis_date
+                        except Exception as e:
+                            logger.warning(f"Broker summary API failed for {ticker}: {e}")
+                            async with status_lock:
+                                _deep_analysis_status["errors"].append(f"{ticker} broksum: {str(e)[:80]}")
+
+                    # 3b. Fetch broker summary for recent trading days (last 4 days before analysis_date)
+                    recent_dates_fetched = []
+                    try:
+                        from datetime import datetime as dt, timedelta
+                        analysis_dt = dt.strptime(analysis_date, '%Y-%m-%d')
+                        for day_offset in range(1, 6):
+                            check_date = analysis_dt - timedelta(days=day_offset)
+                            # Skip weekends
+                            if check_date.weekday() >= 5:
+                                continue
+                            date_str = check_date.strftime('%Y-%m-%d')
+                            # Check if we already have this date in DB
+                            existing = await asyncio.to_thread(neobdm_repo.get_broker_summary, ticker, date_str)
+                            if existing and (existing.get('buy') or existing.get('sell')):
+                                recent_dates_fetched.append(date_str)
+                                continue
+                            # Fetch from API
+                            async def _fetch_recent_with_limiter(fetch_ticker, fetch_date):
+                                try:
+                                    async with broksum_rate_limiter:
+                                        raw = await api_client.get_broker_summary(
+                                            fetch_ticker, fetch_date, fast_fail=True
+                                        )
+                                    return raw, None, {
+                                        "ticker": fetch_ticker,
+                                        "date": fetch_date,
+                                        "source": "recent_dates",
+                                    }
+                                except Exception as fetch_exc:
+                                    return None, fetch_exc, {
+                                        "ticker": fetch_ticker,
+                                        "date": fetch_date,
+                                        "source": "recent_dates",
+                                    }
+
+                            raw_bs = await _fetch_broksum_with_deferred_retry(
+                                fetch_fn=_fetch_recent_with_limiter,
+                                ticker=ticker,
+                                date_str=date_str,
+                                status=_deep_analysis_status,
+                                status_lock=status_lock,
+                            )
+                            if raw_bs and (raw_bs.get('buy') or raw_bs.get('sell')):
+                                async with db_write_lock:
+                                    await asyncio.to_thread(
+                                        neobdm_repo.save_broker_summary_batch,
+                                        ticker, date_str,
+                                        raw_bs.get('buy', []),
+                                        raw_bs.get('sell', [])
+                                    )
+                                recent_dates_fetched.append(date_str)
+                            if len(recent_dates_fetched) >= 4:
+                                break
+                    except Exception as e:
+                        logger.warning(f"Recent days broksum fetch failed for {ticker}: {e}")
+
+                    # 3c. Extract important dates from inventory (turn_dates, peak_dates)
+                    important_dates_data = []
+                    try:
+                        if inv_data:
+                            # Run controlling broker detection early to get turn/peak dates
+                            ctrl_preview = await asyncio.to_thread(
+                                analyzer.detect_controlling_brokers,
+                                inv_data,
+                                price_series=price_series,
+                                min_brokers=3
+                            )
+                            important_date_set = set()
+                            for cb in ctrl_preview.get('controlling_brokers', []):
+                                td = cb.get('turn_date')
+                                pd = cb.get('peak_date')
+                                if td and td != analysis_date:
+                                    important_date_set.add(td)
+                                if pd and pd != analysis_date and pd != td:
+                                    important_date_set.add(pd)
+
+                            # Fetch broker summary for each important date
+                            for imp_date in sorted(important_date_set):
+                                existing = await asyncio.to_thread(neobdm_repo.get_broker_summary, ticker, imp_date)
+                                if existing and (existing.get('buy') or existing.get('sell')):
+                                    important_dates_data.append({
+                                        'date': imp_date,
+                                        'date_type': 'turn_or_peak',
+                                        'buy': existing.get('buy', []),
+                                        'sell': existing.get('sell', []),
+                                    })
+                                    continue
+                                # Fetch from API
+                                async def _fetch_important_with_limiter(fetch_ticker, fetch_date):
+                                    try:
+                                        async with broksum_rate_limiter:
+                                            raw = await api_client.get_broker_summary(
+                                                fetch_ticker, fetch_date, fast_fail=True
+                                            )
+                                        return raw, None, {
+                                            "ticker": fetch_ticker,
+                                            "date": fetch_date,
+                                            "source": "important_dates",
+                                        }
+                                    except Exception as fetch_exc:
+                                        return None, fetch_exc, {
+                                            "ticker": fetch_ticker,
+                                            "date": fetch_date,
+                                            "source": "important_dates",
+                                        }
+
+                                raw_bs = await _fetch_broksum_with_deferred_retry(
+                                    fetch_fn=_fetch_important_with_limiter,
+                                    ticker=ticker,
+                                    date_str=imp_date,
+                                    status=_deep_analysis_status,
+                                    status_lock=status_lock,
+                                )
+                                if raw_bs and (raw_bs.get('buy') or raw_bs.get('sell')):
+                                    async with db_write_lock:
+                                        await asyncio.to_thread(
+                                            neobdm_repo.save_broker_summary_batch,
+                                            ticker, imp_date,
+                                            raw_bs.get('buy', []),
+                                            raw_bs.get('sell', []),
+                                        )
+                                    important_dates_data.append({
+                                        'date': imp_date,
+                                        'date_type': 'turn_or_peak',
+                                        'buy': raw_bs.get('buy', []),
+                                        'sell': raw_bs.get('sell', []),
+                                    })
+                    except Exception as e:
+                        logger.warning(f"Important dates broksum failed for {ticker}: {e}")
+
+                    # 3d. Fetch multi-day broker summary from DB (now enriched with recent fetches)
+                    broksum_multiday = None
+                    try:
+                        broksum_multiday = await asyncio.to_thread(
+                            neobdm_repo.get_broker_summary_multiday,
+                            ticker, analysis_date, days=5
+                        )
+                    except Exception as e:
+                        logger.warning(f"Multi-day broksum fetch failed for {ticker}: {e}")
+
+                    # 3e. Fetch previous deep cache for historical comparison
+                    previous_deep = None
+                    try:
+                        previous_deep = await asyncio.to_thread(
+                            band_repo.get_previous_deep_cache, ticker, analysis_date
+                        )
+                    except Exception as e:
+                        logger.warning(f"Previous deep cache fetch failed for {ticker}: {e}")
+
+                    # Log broker summary date used (if any)
+                    if broksum_data and broksum_used_date:
+                        logger.info(f"Broker summary used for {ticker}: {broksum_used_date}")
+
+                    # 4. Run deep analysis
+                    base_result = base_lookup.get(ticker)
+
+                    # Prepare metadata for data validation
+                    inventory_meta = None
+                    if raw_inv:
+                        inventory_meta = {
+                            'firstDate': raw_inv.get('firstDate'),
+                            'lastDate': raw_inv.get('lastDate')
+                        }
+
+                    broker_summary_meta = {'trade_date': broksum_used_date} if broksum_used_date else None
+
+                    deep_result = await asyncio.to_thread(
+                        analyzer.analyze_deep,
+                        ticker,
+                        inventory_data=inv_data,
+                        txn_chart_data=txn_data,
+                        broker_summary_data=broksum_data,
+                        broksum_multiday_data=broksum_multiday,
+                        price_series=price_series,
+                        base_result=base_result,
+                        previous_deep=previous_deep,
+                        important_dates_data=important_dates_data if important_dates_data else None,
+                        inventory_meta=inventory_meta,
+                        broker_summary_meta=broker_summary_meta
+                    )
+
+                    # 5. Save to cache
+                    async with db_write_lock:
+                        await asyncio.to_thread(band_repo.save_deep_cache, ticker, analysis_date, deep_result)
+
+                    async with status_lock:
+                        _deep_analysis_status["completed_tickers"].append(ticker)
+                        _deep_analysis_status["processed"] = len(_deep_analysis_status["completed_tickers"])
+
+                except Exception as e:
+                    logger.error(f"Deep analysis failed for {ticker}: {e}")
+                    async with status_lock:
+                        _deep_analysis_status["failed_tickers"].append(ticker)
+                        _deep_analysis_status["errors"].append(f"{ticker}: {str(e)[:80]}")
+                        _deep_analysis_status["failed"] = len(_deep_analysis_status["failed_tickers"])
+                finally:
+                    async with status_lock:
+                        if ticker in _deep_analysis_status["active_tickers"]:
+                            _deep_analysis_status["active_tickers"].remove(ticker)
+                        _deep_analysis_status["progress"] = (
+                            len(_deep_analysis_status["completed_tickers"]) +
+                            len(_deep_analysis_status["failed_tickers"])
+                        )
+
+        await asyncio.gather(*[_process_ticker(t) for t in tickers_to_process])
+
+    except Exception as e:
+        logger.error(f"Critical deep analysis error: {e}")
+        async with status_lock:
+            _deep_analysis_status["errors"].append(f"Critical: {str(e)[:120]}")
+    finally:
+        await api_client.close()
+        async with status_lock:
+            _deep_analysis_status["running"] = False
+            _deep_analysis_status["processed"] = len(_deep_analysis_status["completed_tickers"])
+            _deep_analysis_status["failed"] = len(_deep_analysis_status["failed_tickers"])
+            _deep_analysis_status["progress"] = (
+                _deep_analysis_status["processed"] + _deep_analysis_status["failed"]
+            )
+            _deep_analysis_status["current_ticker"] = ""
+            _deep_analysis_status["active_tickers"] = []
+
+            processed = _deep_analysis_status["processed"]
+            failed = _deep_analysis_status["failed"]
+            fresh = _deep_analysis_status["already_fresh_today"]
+        logger.info(
+            "Deep analysis completed: "
+            f"processed={processed}, "
+            f"failed={failed}, "
+            f"fresh={fresh}"
+        )
+
+
+@router.get("/bandarmology/watchlist-alerts")
+async def get_watchlist_alerts(
+    date: Optional[str] = Query(None, description="Analysis date (YYYY-MM-DD). None = latest.")
+):
+    """
+    Auto-watchlist alerts: flag stocks with notable phase transitions or conditions.
+    
+    Detects:
+    - ACCUMULATION → HOLDING with price near bandar cost (ready for breakout)
+    - HOLDING → DISTRIBUTION (exit warning)
+    - Score strongly improving (>10 pts gain)
+    - Golden cross detected
+    """
+    try:
+        from modules.bandarmology_analyzer import BandarmologyAnalyzer
+        from db.bandarmology_repository import BandarmologyRepository
+
+        analyzer = BandarmologyAnalyzer()
+        band_repo = BandarmologyRepository()
+
+        actual_date = analyzer._resolve_date(date)
+        if not actual_date:
+            return {"date": None, "alerts": []}
+
+        # Get all deep caches for this date
+        deep_cache = band_repo.get_deep_cache_batch(actual_date)
+        if not deep_cache:
+            return {"date": actual_date, "alerts": []}
+
+        # Get base results for price info
+        results = analyzer.analyze(target_date=actual_date)
+        base_lookup = {r['symbol']: r for r in results}
+
+        alerts = []
+        for ticker, deep in deep_cache.items():
+            base = base_lookup.get(ticker, {})
+            price = base.get('price', 0)
+            bandar_cost = deep.get('bandar_avg_cost', 0)
+            phase = deep.get('accum_phase', 'UNKNOWN')
+            phase_transition = deep.get('phase_transition', 'NONE')
+            score_trend = deep.get('score_trend', 'NONE')
+            ma_cross = deep.get('ma_cross_signal', 'NONE')
+            deep_score = deep.get('deep_score', 0)
+            prev_phase = deep.get('prev_phase', '')
+
+            # Calculate price vs cost
+            price_vs_cost_pct = 0
+            if price > 0 and bandar_cost > 0:
+                price_vs_cost_pct = round((price - bandar_cost) / bandar_cost * 100, 1)
+
+            # Alert 1: ACCUMULATION → HOLDING with price near cost (READY)
+            if phase_transition == 'ACCUMULATION_TO_HOLDING' and bandar_cost > 0:
+                near_cost = -5 <= price_vs_cost_pct <= 10
+                alerts.append({
+                    "ticker": ticker,
+                    "alert_type": "PHASE_READY",
+                    "priority": "HIGH" if near_cost else "MEDIUM",
+                    "description": f"Fase berubah AKUMULASI → HOLDING, harga {price_vs_cost_pct:+.1f}% dari cost bandar ({bandar_cost:,.0f})",
+                    "phase": phase,
+                    "prev_phase": prev_phase,
+                    "price": price,
+                    "bandar_cost": bandar_cost,
+                    "price_vs_cost_pct": price_vs_cost_pct,
+                    "deep_score": deep_score,
+                })
+
+            # Alert 2: HOLDING with price near cost and high deep score (watchlist candidate)
+            elif phase == 'HOLDING' and bandar_cost > 0 and -5 <= price_vs_cost_pct <= 10 and deep_score >= 30:
+                alerts.append({
+                    "ticker": ticker,
+                    "alert_type": "HOLDING_NEAR_COST",
+                    "priority": "HIGH",
+                    "description": f"HOLDING + harga dekat cost bandar ({price_vs_cost_pct:+.1f}%), deep score {deep_score}",
+                    "phase": phase,
+                    "prev_phase": prev_phase,
+                    "price": price,
+                    "bandar_cost": bandar_cost,
+                    "price_vs_cost_pct": price_vs_cost_pct,
+                    "deep_score": deep_score,
+                })
+
+            # Alert 3: HOLDING/ACCUMULATION → DISTRIBUTION (exit warning)
+            elif phase_transition in ('HOLDING_TO_DISTRIBUTION', 'ACCUMULATION_TO_DISTRIBUTION'):
+                alerts.append({
+                    "ticker": ticker,
+                    "alert_type": "PHASE_EXIT",
+                    "priority": "HIGH",
+                    "description": f"WARNING: Fase berubah {prev_phase} → DISTRIBUSI, bandar mulai jual!",
+                    "phase": phase,
+                    "prev_phase": prev_phase,
+                    "price": price,
+                    "bandar_cost": bandar_cost,
+                    "price_vs_cost_pct": price_vs_cost_pct,
+                    "deep_score": deep_score,
+                })
+
+            # Alert 4: Golden cross detected
+            elif ma_cross == 'GOLDEN_CROSS' and deep_score >= 20:
+                alerts.append({
+                    "ticker": ticker,
+                    "alert_type": "GOLDEN_CROSS",
+                    "priority": "MEDIUM",
+                    "description": f"GOLDEN CROSS terdeteksi, deep score {deep_score}",
+                    "phase": phase,
+                    "prev_phase": prev_phase,
+                    "price": price,
+                    "bandar_cost": bandar_cost,
+                    "price_vs_cost_pct": price_vs_cost_pct,
+                    "deep_score": deep_score,
+                })
+
+            # Alert 5: Score strongly improving
+            elif score_trend == 'STRONG_IMPROVING' and deep_score >= 25:
+                alerts.append({
+                    "ticker": ticker,
+                    "alert_type": "SCORE_SURGE",
+                    "priority": "MEDIUM",
+                    "description": f"Deep score naik signifikan (sekarang {deep_score}, sebelumnya {deep.get('prev_deep_score', 0)})",
+                    "phase": phase,
+                    "prev_phase": prev_phase,
+                    "price": price,
+                    "bandar_cost": bandar_cost,
+                    "price_vs_cost_pct": price_vs_cost_pct,
+                    "deep_score": deep_score,
+                })
+
+        # Sort by priority (HIGH first) then by deep_score
+        priority_order = {'HIGH': 0, 'MEDIUM': 1, 'LOW': 2}
+        alerts.sort(key=lambda a: (priority_order.get(a['priority'], 2), -a['deep_score']))
+
+        return sanitize_data({
+            "date": actual_date,
+            "total_alerts": len(alerts),
+            "alerts": alerts
+        })
+
+    except Exception as e:
+        logger.error(f"Watchlist alerts error: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)}
+        )
+
+
+@router.get("/bandarmology/{ticker}/detail")
+async def get_stock_detail(
+    ticker: str,
+    date: Optional[str] = Query(None, description="Analysis date"),
+    profile: str = Query("balanced", description="Scoring profile: balanced|swing|daytrade")
+):
+    """
+    Get detailed deep analysis for a single stock.
+    
+    Returns comprehensive data including:
+    - Base screening scores
+    - Inventory broker breakdown (accumulation/distribution)
+    - Transaction chart flows (MM, Foreign, Institution)
+    - Broker summary (top buyers/sellers, avg prices)
+    - Entry/target price analysis
+    - Swing vs Intraday classification with reasoning
+    """
+    try:
+        from modules.bandarmology_analyzer import BandarmologyAnalyzer
+        from db.bandarmology_repository import BandarmologyRepository
+        from db.neobdm_repository import NeoBDMRepository
+
+        analyzer = BandarmologyAnalyzer()
+        band_repo = BandarmologyRepository()
+        neobdm_repo = NeoBDMRepository()
+
+        actual_date = analyzer._resolve_date(date)
+        ticker_upper = ticker.upper()
+
+        # 1. Get base screening result
+        results = analyzer.analyze(target_date=actual_date, profile=profile)
+        base_result = next((r for r in results if r['symbol'] == ticker_upper), None)
+
+        # 2. Get deep cache (check early to handle tickers not in screening)
+        deep_cache = band_repo.get_deep_cache(ticker_upper, actual_date)
+
+        # If not in screening results but has deep cache, create minimal base result
+        if not base_result and deep_cache:
+            logger.info(f"Ticker {ticker_upper} not in screening but has deep cache, using deep data only")
+            base_result = _create_minimal_result_from_deep(ticker_upper, deep_cache, actual_date)
+
+        if not base_result:
+            return JSONResponse(
+                status_code=404,
+                content={"error": f"Stock {ticker_upper} not found in screening results or deep analysis cache"}
+            )
+
+        # 3. Get inventory brokers from DB
+        inventory_brokers = band_repo.get_inventory(ticker_upper)
+
+        # 4. Get transaction chart from DB
+        txn_chart = band_repo.get_transaction_chart(ticker_upper)
+
+        # 5. Get broker summary from DB (prefer latest available if newer than analysis date)
+        broker_summary = {"buy": [], "sell": []}
+        broker_summary_date = actual_date
+        latest_broksum_date = None
+        try:
+            available_dates = neobdm_repo.get_available_dates_for_ticker(ticker_upper)
+            if available_dates:
+                latest_broksum_date = available_dates[0]
+        except Exception as e:
+            logger.debug(f"Failed to get available broker summary dates for {ticker_upper}: {e}")
+
+        if actual_date:
+            broker_summary = neobdm_repo.get_broker_summary(ticker_upper, actual_date)
+
+        # If no data for analysis date OR a newer date exists, use latest available
+        use_latest = False
+        if latest_broksum_date:
+            if not actual_date or latest_broksum_date > actual_date:
+                use_latest = True
+            elif (not broker_summary.get("buy") and not broker_summary.get("sell")) and latest_broksum_date != actual_date:
+                use_latest = True
+
+        if use_latest and latest_broksum_date:
+            latest_summary = neobdm_repo.get_broker_summary(ticker_upper, latest_broksum_date)
+            if latest_summary.get("buy") or latest_summary.get("sell"):
+                broker_summary = latest_summary
+                broker_summary_date = latest_broksum_date
+
+        # Fallback to recent multiday <= actual_date if still empty
+        if actual_date and (not broker_summary.get("buy") and not broker_summary.get("sell")):
+            recent_broksum = neobdm_repo.get_broker_summary_multiday(ticker_upper, actual_date, days=5)
+            if recent_broksum:
+                broker_summary = {
+                    "buy": recent_broksum[0].get("buy", []),
+                    "sell": recent_broksum[0].get("sell", []),
+                }
+                broker_summary_date = recent_broksum[0].get("date")
+
+        # 6. Get floor price analysis (historical)
+        floor_analysis = neobdm_repo.get_floor_price_analysis(ticker_upper, days=30)
+
+        # 7. Get top holders
+        top_holders = neobdm_repo.get_top_holders_by_net_lot(ticker_upper, limit=5)
+
+        # Build response
+        detail = {
+            "ticker": ticker_upper,
+            "date": actual_date,
+            "has_deep": deep_cache is not None and deep_cache.get('deep_score', 0) > 0,
+
+            # Base screening
+            "base_score": base_result.get('total_score', 0),
+            "max_base_score": base_result.get('max_score', 100),
+            "trade_type": base_result.get('trade_type', '—'),
+            "price": base_result.get('price', 0),
+            "pct_1d": base_result.get('pct_1d', 0),
+            "ma_above_count": base_result.get('ma_above_count', 0),
+            "pinky": base_result.get('pinky', False),
+            "crossing": base_result.get('crossing', False),
+            "unusual": base_result.get('unusual', False),
+            "likuid": base_result.get('likuid', False),
+            "confluence_status": base_result.get('confluence_status', 'NONE'),
+            "scores": base_result.get('scores', {}),
+
+            # Weekly/daily flows
+            "w_4": base_result.get('w_4', 0),
+            "w_3": base_result.get('w_3', 0),
+            "w_2": base_result.get('w_2', 0),
+            "w_1": base_result.get('w_1', 0),
+            "d_0_mm": base_result.get('d_0_mm', 0),
+            "d_0_nr": base_result.get('d_0_nr', 0),
+            "d_0_ff": base_result.get('d_0_ff', 0),
+        }
+
+        # Deep analysis data
+        if deep_cache:
+            detail.update({
+                "deep_score": deep_cache.get('deep_score', 0),
+                "combined_score": base_result.get('total_score', 0) + deep_cache.get('deep_score', 0),
+                "max_combined_score": 285,  # 100 base + 185 deep (updated with Yahoo Finance enhancements)
+                "deep_trade_type": deep_cache.get('deep_trade_type', '—'),
+                "deep_signals": deep_cache.get('deep_signals', {}),
+
+                # Inventory
+                "inv_accum_brokers": deep_cache.get('inv_accum_brokers', 0),
+                "inv_distrib_brokers": deep_cache.get('inv_distrib_brokers', 0),
+                "inv_clean_brokers": deep_cache.get('inv_clean_brokers', 0),
+                "inv_tektok_brokers": deep_cache.get('inv_tektok_brokers', 0),
+                "inv_total_accum_lot": deep_cache.get('inv_total_accum_lot', 0),
+                "inv_total_distrib_lot": deep_cache.get('inv_total_distrib_lot', 0),
+                "inv_top_accum_broker": deep_cache.get('inv_top_accum_broker', ''),
+
+                # Transaction chart
+                "txn_mm_cum": deep_cache.get('txn_mm_cum', 0),
+                "txn_foreign_cum": deep_cache.get('txn_foreign_cum', 0),
+                "txn_institution_cum": deep_cache.get('txn_institution_cum', 0),
+                "txn_retail_cum": deep_cache.get('txn_retail_cum', 0),
+                "txn_cross_index": deep_cache.get('txn_cross_index', 0),
+                "txn_mm_trend": deep_cache.get('txn_mm_trend', ''),
+                "txn_foreign_trend": deep_cache.get('txn_foreign_trend', ''),
+
+                # Broker summary
+                "broksum_total_buy_lot": deep_cache.get('broksum_total_buy_lot', 0),
+                "broksum_total_sell_lot": deep_cache.get('broksum_total_sell_lot', 0),
+                "broksum_avg_buy_price": deep_cache.get('broksum_avg_buy_price', 0),
+                "broksum_avg_sell_price": deep_cache.get('broksum_avg_sell_price', 0),
+                "broksum_floor_price": deep_cache.get('broksum_floor_price', 0),
+                "broksum_net_institutional": deep_cache.get('broksum_net_institutional', 0),
+                "broksum_net_foreign": deep_cache.get('broksum_net_foreign', 0),
+                "broksum_top_buyers": deep_cache.get('broksum_top_buyers', []),
+                "broksum_top_sellers": deep_cache.get('broksum_top_sellers', []),
+
+                # Entry/target
+                "entry_price": deep_cache.get('entry_price', 0),
+                "target_price": deep_cache.get('target_price', 0),
+                "stop_loss": deep_cache.get('stop_loss', 0),
+                "risk_reward_ratio": deep_cache.get('risk_reward_ratio', 0),
+                "target_method": deep_cache.get('target_method', ''),
+                "stop_method": deep_cache.get('stop_method', ''),
+
+                # Controlling broker analysis
+                "controlling_brokers": deep_cache.get('controlling_brokers', []),
+                "accum_start_date": deep_cache.get('accum_start_date'),
+                "accum_phase": deep_cache.get('accum_phase', 'UNKNOWN'),
+                "bandar_avg_cost": deep_cache.get('bandar_avg_cost', 0),
+                "bandar_total_lot": deep_cache.get('bandar_total_lot', 0),
+                "coordination_score": deep_cache.get('coordination_score', 0),
+                "phase_confidence": deep_cache.get('phase_confidence', 'LOW'),
+                "breakout_signal": deep_cache.get('breakout_signal', 'NONE'),
+                "bandar_peak_lot": deep_cache.get('bandar_peak_lot', 0),
+                "bandar_distribution_pct": deep_cache.get('bandar_distribution_pct', 0.0),
+                "distribution_alert": deep_cache.get('distribution_alert', 'NONE'),
+
+                # Cross-reference: broker summary <-> inventory
+                "bandar_buy_today_count": deep_cache.get('bandar_buy_today_count', 0),
+                "bandar_sell_today_count": deep_cache.get('bandar_sell_today_count', 0),
+                "bandar_buy_today_lot": deep_cache.get('bandar_buy_today_lot', 0),
+                "bandar_sell_today_lot": deep_cache.get('bandar_sell_today_lot', 0),
+                "bandar_confirmation": deep_cache.get('bandar_confirmation', 'NONE'),
+
+                # Multi-day consistency
+                "broksum_days_analyzed": deep_cache.get('broksum_days_analyzed', 0),
+                "broksum_consistency_score": deep_cache.get('broksum_consistency_score', 0),
+                "broksum_consistent_buyers": deep_cache.get('broksum_consistent_buyers', []),
+                "broksum_consistent_sellers": deep_cache.get('broksum_consistent_sellers', []),
+
+                # Breakout probability
+                "breakout_probability": deep_cache.get('breakout_probability', 0),
+                "breakout_factors": deep_cache.get('breakout_factors', {}),
+
+                # Accumulation duration
+                "accum_duration_days": deep_cache.get('accum_duration_days', 0),
+
+                # Concentration risk
+                "concentration_broker": deep_cache.get('concentration_broker'),
+                "concentration_pct": deep_cache.get('concentration_pct', 0.0),
+                "concentration_risk": deep_cache.get('concentration_risk', 'NONE'),
+
+                # Smart money vs retail divergence
+                "txn_smart_money_cum": deep_cache.get('txn_smart_money_cum', 0),
+                "txn_retail_cum_deep": deep_cache.get('txn_retail_cum_deep', 0),
+                "smart_retail_divergence": deep_cache.get('smart_retail_divergence', 0),
+
+                # Volume context
+                "volume_score": deep_cache.get('volume_score', 0),
+                "volume_signal": deep_cache.get('volume_signal', 'NONE'),
+                "volume_confirmation_multiplier": deep_cache.get('volume_confirmation_multiplier', 0),
+
+                # MA cross
+                "ma_cross_signal": deep_cache.get('ma_cross_signal', 'NONE'),
+                "ma_cross_score": deep_cache.get('ma_cross_score', 0),
+
+                # Historical comparison
+                "prev_deep_score": deep_cache.get('prev_deep_score', 0),
+                "prev_phase": deep_cache.get('prev_phase', ''),
+                "phase_transition": deep_cache.get('phase_transition', 'NONE'),
+                "score_trend": deep_cache.get('score_trend', 'NONE'),
+
+                # Flow velocity/acceleration
+                "flow_velocity_mm": deep_cache.get('flow_velocity_mm', 0),
+                "flow_velocity_foreign": deep_cache.get('flow_velocity_foreign', 0),
+                "flow_velocity_institution": deep_cache.get('flow_velocity_institution', 0),
+                "flow_acceleration_mm": deep_cache.get('flow_acceleration_mm', 0),
+                "flow_acceleration_signal": deep_cache.get('flow_acceleration_signal', 'NONE'),
+                "flow_velocity_score": deep_cache.get('flow_velocity_score', 0),
+
+                # Important dates broker summary
+                "important_dates": deep_cache.get('important_dates', []),
+                "important_dates_score": deep_cache.get('important_dates_score', 0),
+                "important_dates_signal": deep_cache.get('important_dates_signal', 'NONE'),
+
+                # Pump tomorrow prediction
+                "pump_tomorrow_score": deep_cache.get('pump_tomorrow_score', 0),
+                "pump_tomorrow_signal": deep_cache.get('pump_tomorrow_signal', 'NONE'),
+                "pump_tomorrow_factors": deep_cache.get('pump_tomorrow_factors', {}),
+                "pump_tomorrow_validation_note": deep_cache.get('pump_tomorrow_validation_note') or 'Rule-based heuristic signal; belum tervalidasi out-of-sample.',
+                "pump_tomorrow_is_predictive": deep_cache.get('pump_tomorrow_is_predictive', False),
+
+                # Data freshness (Improvement 7)
+                "data_freshness": deep_cache.get('data_freshness', 1.0),
+                "data_source_date": deep_cache.get('data_source_date', ''),
+                "original_deep_score": deep_cache.get('original_deep_score', 0),
+
+                # Relative context (Improvement 4)
+                "relative_context": deep_cache.get('relative_context', {}),
+
+                # Conflict warning (Improvement 5)
+                "conflict_stats": deep_cache.get('conflict_stats', None),
+                "data_source_conflict": deep_cache.get('data_source_conflict', False),
+
+                # Yahoo Finance Enhanced Features
+                # Float analysis
+                "bandar_float_pct": deep_cache.get('bandar_float_pct', 0),
+                "float_control_level": deep_cache.get('float_control_level'),
+                "float_score": deep_cache.get('float_score', 0),
+
+                # Volume anomaly
+                "volume_anomaly_score": deep_cache.get('volume_anomaly_score', 0),
+
+                # Bandar power
+                "bandar_power_score": deep_cache.get('bandar_power_score'),
+                "bandar_power_rating": deep_cache.get('bandar_power_rating'),
+                "bandar_power_components": deep_cache.get('bandar_power_components', {}),
+
+                # Earnings timing
+                "earnings_score": deep_cache.get('earnings_score', 0),
+                "days_to_earnings": deep_cache.get('days_to_earnings'),
+                "earnings_signal": deep_cache.get('earnings_signal'),
+            })
+        else:
+            detail.update({
+                "deep_score": 0,
+                "combined_score": base_result.get('total_score', 0),
+                "max_combined_score": 250,
+                "ma_cross_signal": 'NONE',
+                "ma_cross_score": 0,
+                "prev_deep_score": 0,
+                "prev_phase": '',
+                "phase_transition": 'NONE',
+                "score_trend": 'NONE',
+            })
+
+        # Inventory broker detail list
+        if inventory_brokers:
+            detail["inventory_brokers"] = inventory_brokers
+        else:
+            detail["inventory_brokers"] = []
+
+        # Transaction chart raw data
+        if txn_chart:
+            detail["txn_chart"] = txn_chart
+        else:
+            detail["txn_chart"] = None
+
+        # Broker summary detail
+        detail["broker_summary"] = broker_summary if broker_summary else {"buy": [], "sell": []}
+        detail["broker_summary_date"] = broker_summary_date
+
+        # Keep broker-summary-derived metrics synchronized with the broker_summary block shown in response.
+        buy_list = detail["broker_summary"].get("buy", [])
+        sell_list = detail["broker_summary"].get("sell", [])
+        parse_num = analyzer._parse_broksum_num
+
+        # Reset broker-summary-derived fields first to avoid leaking stale deep-cache values.
+        detail["broksum_total_buy_lot"] = 0
+        detail["broksum_total_sell_lot"] = 0
+        detail["broksum_avg_buy_price"] = 0
+        detail["broksum_avg_sell_price"] = 0
+        detail["broksum_top_buyers"] = []
+        detail["broksum_top_sellers"] = []
+        detail["broksum_net_institutional"] = 0
+        detail["broksum_net_foreign"] = 0
+        detail["broksum_floor_price"] = 0
+
+        if buy_list or sell_list:
+            total_buy_lot = sum(parse_num(b.get("nlot", 0)) for b in buy_list)
+            total_sell_lot = sum(parse_num(s.get("nlot", 0)) for s in sell_list)
+            total_buy_val = sum(parse_num(b.get("nval", 0)) for b in buy_list)
+            total_sell_val = sum(parse_num(s.get("nval", 0)) for s in sell_list)
+
+            detail["broksum_total_buy_lot"] = total_buy_lot
+            detail["broksum_total_sell_lot"] = total_sell_lot
+
+            if total_buy_lot > 0 and total_buy_val > 0:
+                detail["broksum_avg_buy_price"] = round((total_buy_val * 1e9) / (total_buy_lot * 100), 0)
+            if total_sell_lot > 0 and total_sell_val > 0:
+                detail["broksum_avg_sell_price"] = round((total_sell_val * 1e9) / (total_sell_lot * 100), 0)
+
+            detail["broksum_top_buyers"] = [
+                {
+                    "broker": b.get("broker", ""),
+                    "nlot": parse_num(b.get("nlot", 0)),
+                    "avg_price": parse_num(b.get("avg_price", b.get("bavg", 0))),
+                }
+                for b in buy_list[:5]
+            ]
+            detail["broksum_top_sellers"] = [
+                {
+                    "broker": s.get("broker", ""),
+                    "nlot": parse_num(s.get("nlot", 0)),
+                    "avg_price": parse_num(s.get("avg_price", s.get("savg", 0))),
+                }
+                for s in sell_list[:5]
+            ]
+
+            inst_net = 0
+            foreign_net = 0
+            for b in buy_list:
+                code = b.get("broker", "")
+                info = analyzer.broker_classes.get(code, {})
+                cats = info.get("categories", [])
+                nlot = parse_num(b.get("nlot", 0))
+                if "institutional" in cats:
+                    inst_net += nlot
+                if "foreign" in cats:
+                    foreign_net += nlot
+            for s in sell_list:
+                code = s.get("broker", "")
+                info = analyzer.broker_classes.get(code, {})
+                cats = info.get("categories", [])
+                nlot = parse_num(s.get("nlot", 0))
+                if "institutional" in cats:
+                    inst_net -= nlot
+                if "foreign" in cats:
+                    foreign_net -= nlot
+
+            detail["broksum_net_institutional"] = inst_net
+            detail["broksum_net_foreign"] = foreign_net
+
+            inst_buy_lot = 0
+            inst_buy_val = 0
+            for b in buy_list:
+                code = b.get("broker", "")
+                info = analyzer.broker_classes.get(code, {})
+                cats = info.get("categories", [])
+                if "institutional" in cats or "foreign" in cats:
+                    inst_buy_lot += parse_num(b.get("nlot", 0))
+                    inst_buy_val += parse_num(b.get("nval", 0))
+            if inst_buy_lot > 0 and inst_buy_val > 0:
+                detail["broksum_floor_price"] = round((inst_buy_val * 1e9) / (inst_buy_lot * 100), 0)
+
+        # Floor price analysis
+        detail["floor_analysis"] = floor_analysis if floor_analysis else {}
+
+        # Top holders
+        detail["top_holders"] = top_holders if top_holders else []
+
+        return sanitize_data(detail)
+
+    except Exception as e:
+        logger.error(f"Stock detail error for {ticker}: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)}
+        )
+
+
+@router.get("/bandarmology/float-analysis/{ticker}")
+async def get_float_analysis(
+    ticker: str,
+    force_refresh: bool = Query(False, description="Force refresh from Yahoo Finance")
+):
+    """
+    Get float analysis for a specific ticker.
+
+    Returns float shares, outstanding shares, and bandar control percentage.
+    """
+    try:
+        from modules.yahoo_finance_enhanced import get_yahoo_finance_enhanced
+
+        yf_enhanced = get_yahoo_finance_enhanced()
+
+        # Fetch float data
+        float_data = yf_enhanced.fetch_float_data(ticker.upper(), force_refresh)
+
+        if not float_data:
+            return JSONResponse(
+                status_code=404,
+                content={"error": f"Float data not available for {ticker}"}
+            )
+
+        return sanitize_data(float_data)
+
+    except Exception as e:
+        logger.error(f"Float analysis error for {ticker}: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)}
+        )
+
+
+@router.get("/bandarmology/volume-metrics/{ticker}")
+async def get_volume_metrics(
+    ticker: str,
+    force_refresh: bool = Query(False, description="Force refresh from Yahoo Finance")
+):
+    """
+    Get volume metrics for anomaly detection.
+
+    Returns current volume, averages, volume ratio, and signal classification.
+    """
+    try:
+        from modules.volume_analyzer import get_volume_analyzer
+
+        volume_analyzer = get_volume_analyzer()
+
+        # Force refresh if requested
+        if force_refresh:
+            volume_analyzer.yf_enhanced.fetch_volume_metrics(ticker.upper(), force_refresh=True)
+
+        metrics = volume_analyzer.calculate_volume_metrics(ticker.upper())
+
+        if not metrics:
+            return JSONResponse(
+                status_code=404,
+                content={"error": f"Volume metrics not available for {ticker}"}
+            )
+
+        return sanitize_data(metrics)
+
+    except Exception as e:
+        logger.error(f"Volume metrics error for {ticker}: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)}
+        )
+
+
+@router.get("/bandarmology/power-scores")
+async def get_bandar_power_scores(
+    limit: int = Query(50, description="Maximum number of results"),
+    min_rating: Optional[str] = Query(None, description="Minimum rating filter (EXCELLENT, GOOD, MODERATE, POOR)")
+):
+    """
+    Get stocks ranked by Bandar Power Score.
+
+    Composite scoring based on float, volume, beta, position, and institutional flow.
+    """
+    try:
+        from modules.bandar_power_calculator import get_bandar_power_calculator
+
+        calculator = get_bandar_power_calculator()
+        scores = calculator.get_top_scores(limit=limit, min_rating=min_rating)
+
+        return {
+            "scores": sanitize_data(scores),
+            "count": len(scores),
+            "max_score": 100,
+            "rating_thresholds": {
+                "EXCELLENT": 80,
+                "GOOD": 65,
+                "MODERATE": 50,
+                "POOR": 0
+            }
+        }
+
+    except Exception as e:
+        logger.error(f"Power scores error: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)}
+        )
+
+
+@router.get("/bandarmology/power-scores/{ticker}")
+async def get_bandar_power_detail(
+    ticker: str,
+    force_refresh: bool = Query(False, description="Force recalculation")
+):
+    """
+    Get detailed Bandar Power Score for a specific ticker.
+
+    Includes component breakdown and metadata.
+    """
+    try:
+        from modules.bandar_power_calculator import get_bandar_power_calculator
+
+        calculator = get_bandar_power_calculator()
+        result = calculator.calculate_score(ticker.upper(), force_refresh=force_refresh)
+
+        if not result:
+            return JSONResponse(
+                status_code=404,
+                content={"error": f"Bandar power score not available for {ticker}"}
+            )
+
+        return sanitize_data(result)
+
+    except Exception as e:
+        logger.error(f"Bandar power detail error for {ticker}: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)}
+        )
+
+
+@router.get("/bandarmology/earnings-calendar")
+async def get_earnings_calendar(
+    days: int = Query(30, description="Number of days to look ahead"),
+    ticker: Optional[str] = Query(None, description="Specific ticker or all")
+):
+    """
+    Get earnings calendar for upcoming earnings dates.
+
+    Useful for detecting pre-earnings accumulation patterns.
+    """
+    try:
+        from modules.earnings_tracker import get_earnings_tracker
+
+        tracker = get_earnings_tracker()
+
+        if ticker:
+            earnings = tracker.fetch_upcoming_earnings(ticker.upper(), days_ahead=days)
+        else:
+            earnings = tracker._get_all_cached_earnings(days_ahead=days)
+
+        return {
+            "earnings": sanitize_data(earnings),
+            "count": len(earnings),
+            "days_ahead": days
+        }
+
+    except Exception as e:
+        logger.error(f"Earnings calendar error: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)}
+        )
+
+
+@router.get("/bandarmology/earnings-calendar/{ticker}")
+async def get_ticker_earnings(
+    ticker: str,
+    days: int = Query(30, description="Number of days to look ahead"),
+    force_refresh: bool = Query(False, description="Force refresh from Yahoo Finance")
+):
+    """
+    Get earnings data for a specific ticker including pattern detection.
+    """
+    try:
+        from modules.earnings_tracker import get_earnings_tracker
+
+        tracker = get_earnings_tracker()
+
+        # Fetch upcoming earnings
+        earnings = tracker.fetch_upcoming_earnings(
+            ticker.upper(),
+            days_ahead=days,
+            force_refresh=force_refresh
+        )
+
+        # Detect pre-earnings pattern
+        pattern = tracker.detect_pre_earnings_pattern(ticker.upper())
+
+        # Get earnings history
+        history = tracker._get_earnings_history(ticker.upper())
+
+        return sanitize_data({
+            "ticker": ticker.upper(),
+            "upcoming_earnings": earnings,
+            "earnings_history": history[:8],  # Last 8 quarters
+            "pattern_detection": pattern
+        })
+
+    except Exception as e:
+        logger.error(f"Ticker earnings error for {ticker}: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)}
+        )
+
+
+@router.get("/bandarmology/pre-earnings-opportunities")
+async def get_pre_earnings_opportunities(
+    min_confidence: int = Query(60, description="Minimum confidence threshold")
+):
+    """
+    Get list of tickers showing pre-earnings accumulation patterns.
+
+    Combines earnings calendar with bandar activity detection.
+    """
+    try:
+        from modules.earnings_tracker import get_earnings_tracker
+
+        tracker = get_earnings_tracker()
+        opportunities = tracker.get_pre_earnings_opportunities(min_confidence=min_confidence)
+
+        return {
+            "opportunities": sanitize_data(opportunities),
+            "count": len(opportunities),
+            "min_confidence": min_confidence
+        }
+
+    except Exception as e:
+        logger.error(f"Pre-earnings opportunities error: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)}
+        )

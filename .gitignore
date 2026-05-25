@@ -1,0 +1,11 @@
+node_modules/
+.next/
+venv/
+.venv/
+__pycache__/
+.env
+.env.local
+.env.*.local
+Dataset-Saham-IDX-master/
+database.sql
+bandarmology_backup.php

@@ -1,0 +1,1516 @@
+'use client';
+
+import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
+import { bandarmologyApi, BandarmologyItem, DeepAnalysisStatus } from '@/services/api/bandarmology';
+import { schedulerApi } from '@/services/api/scheduler';
+import {
+    RefreshCcw,
+    AlertCircle,
+    ChevronUp,
+    ChevronDown,
+    Calendar,
+    Target,
+    TrendingUp,
+    Zap,
+    Eye,
+    Filter,
+    Download,
+    ArrowUpDown,
+    Microscope,
+    Loader2,
+    CheckCircle2,
+    Info,
+    Search,
+    Settings2,
+    ChevronRight
+} from 'lucide-react';
+import { cn } from '@/lib/utils';
+import { Checkbox } from '@/components/ui/checkbox';
+import StockDetailModal from '@/components/bandarmology/StockDetailModal';
+import {
+    FloatCell,
+    PowerCell,
+    VolumeCell,
+    EarningsCell
+} from '@/components/bandarmology/YahooFinanceCompactCells';
+import { YahooFinanceDetailPanel } from '@/components/bandarmology/YahooFinanceDetailPanel';
+
+type SortDirection = 'asc' | 'desc';
+type SortConfig = { key: keyof BandarmologyItem; direction: SortDirection } | null;
+type StrategyPreset = 'NONE' | 'METHOD_1' | 'METHOD_2';
+
+const TRADE_TYPE_CONFIG: Record<string, { label: string; color: string; bg: string }> = {
+    'BOTH': { label: 'SWING + INTRA', color: 'text-yellow-300', bg: 'bg-yellow-500/20 border-yellow-500/30' },
+    'SWING': { label: 'SWING', color: 'text-emerald-300', bg: 'bg-emerald-500/20 border-emerald-500/30' },
+    'INTRADAY': { label: 'INTRADAY', color: 'text-cyan-300', bg: 'bg-cyan-500/20 border-cyan-500/30' },
+    'WATCH': { label: 'WATCH', color: 'text-orange-300', bg: 'bg-orange-500/20 border-orange-500/30' },
+    'SELL': { label: 'SELL', color: 'text-red-300', bg: 'bg-red-500/20 border-red-500/30' },
+    '—': { label: '—', color: 'text-zinc-600', bg: 'bg-transparent' },
+};
+
+const MAX_COMBINED_SCORE = 285;
+
+const CONFLUENCE_CONFIG: Record<string, { label: string; color: string }> = {
+    'TRIPLE': { label: '●●●', color: 'text-yellow-400' },
+    'DOUBLE': { label: '●●○', color: 'text-emerald-400' },
+    'SINGLE': { label: '●○○', color: 'text-blue-400' },
+    'NONE': { label: '○○○', color: 'text-zinc-600' },
+};
+
+function ScoreBar({ score, max = 100 }: { score: number; max?: number }) {
+    const pct = Math.min((score / max) * 100, 100);
+    let barColor = 'bg-zinc-600';
+    if (pct >= 70) barColor = 'bg-emerald-500';
+    else if (pct >= 50) barColor = 'bg-blue-500';
+    else if (pct >= 30) barColor = 'bg-orange-500';
+    else if (pct > 0) barColor = 'bg-red-500';
+
+    return (
+        <div className="flex items-center gap-1.5 w-full">
+            <div className="flex-1 h-1.5 bg-zinc-800 rounded-full overflow-hidden">
+                <div className={cn("h-full rounded-full transition-all", barColor)} style={{ width: `${pct}%` }} />
+            </div>
+            <span className={cn(
+                "text-[10px] font-bold tabular-nums min-w-[24px] text-right",
+                pct >= 70 ? 'text-emerald-400' : pct >= 50 ? 'text-blue-400' : pct >= 30 ? 'text-orange-400' : 'text-zinc-500'
+            )}>
+                {score}
+            </span>
+        </div>
+    );
+}
+
+function FlowCell({ value }: { value: number }) {
+    if (!value || value === 0) return <span className="text-zinc-700">—</span>;
+    const isPositive = value > 0;
+    const formatted = value.toLocaleString('id-ID', { maximumFractionDigits: 1 });
+    return (
+        <span className={cn("tabular-nums font-bold", isPositive ? 'text-emerald-400' : 'text-red-400')}>
+            {isPositive ? '+' : ''}{formatted}
+        </span>
+    );
+}
+
+function FlagBadge({ active, label }: { active: boolean; label: string }) {
+    if (!active) return <span className="text-zinc-700 text-[9px]">—</span>;
+    return (
+        <span className="text-pink-400 font-black text-[10px] bg-pink-500/15 px-1 py-0.5 rounded">
+            {label}
+        </span>
+    );
+}
+
+export default function BandarmologyPage() {
+    const [loading, setLoading] = useState(false);
+    const [data, setData] = useState<BandarmologyItem[]>([]);
+    const [analysisDate, setAnalysisDate] = useState<string | null>(null);
+    const [error, setError] = useState<string | null>(null);
+    const [availableDates, setAvailableDates] = useState<string[]>([]);
+    const [selectedDate, setSelectedDate] = useState<string>("");
+    const [sortConfig, setSortConfig] = useState<SortConfig>({ key: 'total_score', direction: 'desc' });
+    const [tradeTypeFilter, setTradeTypeFilter] = useState<string>("");
+    const [minScoreFilter, setMinScoreFilter] = useState<number>(0);
+    const [strategyPreset, setStrategyPreset] = useState<StrategyPreset>('NONE');
+    const [searchTicker, setSearchTicker] = useState<string>("");
+    const [flagFilters, setFlagFilters] = useState<Record<string, boolean>>({});
+    const [currentPage, setCurrentPage] = useState(1);
+    const [deepStatus, setDeepStatus] = useState<DeepAnalysisStatus | null>(null);
+    const [deepLoading, setDeepLoading] = useState(false);
+    const [hasDeepData, setHasDeepData] = useState(false);
+    const [expandedRow, setExpandedRow] = useState<string | null>(null);
+    const [selectedTicker, setSelectedTicker] = useState<string | null>(null);
+    const [manualTicker, setManualTicker] = useState('');
+    const [manualDeepLoading, setManualDeepLoading] = useState(false);
+    const [deepTopN, setDeepTopN] = useState<number>(30);
+    const [deepConcurrency, setDeepConcurrency] = useState<number>(4);
+    const [yahooRefreshing, setYahooRefreshing] = useState(false);
+    const [yahooTopN, setYahooTopN] = useState<number>(200);
+    const [yahooRefreshResult, setYahooRefreshResult] = useState<{
+        status: string;
+        total_tickers?: number;
+        totals?: Record<string, number>;
+        errors?: Array<{ ticker: string; error: string }>;
+        error?: string;
+    } | null>(null);
+    const [columnMenuOpen, setColumnMenuOpen] = useState(false);
+    const columnMenuRef = useRef<HTMLDivElement>(null);
+    const deepPollRef = useRef<NodeJS.Timeout | null>(null);
+    const pageSize = 50;
+
+    // Column visibility state with localStorage persistence
+    const [visibleColumns, setVisibleColumns] = useState<{
+        float: boolean;
+        power: boolean;
+        volume: boolean;
+        earnings: boolean;
+    }>(() => {
+        if (typeof window !== 'undefined') {
+            const saved = localStorage.getItem('bandarmology_yahoo_columns');
+            if (saved) {
+                try {
+                    return JSON.parse(saved);
+                } catch { /* ignore */ }
+            }
+        }
+        return { float: true, power: true, volume: true, earnings: true };
+    });
+    const [forceDeepAnalyze, setForceDeepAnalyze] = useState(false);
+
+    const loadData = async (dateOverride?: string) => {
+        setLoading(true);
+        setError(null);
+        try {
+            const result = await bandarmologyApi.getScreening(
+                dateOverride ?? (selectedDate || undefined),
+                0  // fetch all, we filter client-side
+            );
+            setData(result.data);
+            setAnalysisDate(result.date);
+            setHasDeepData(result.has_deep_data || false);
+            if (result.deep_analysis_running) {
+                startDeepPolling();
+            }
+        } catch (err: unknown) {
+            setError(err instanceof Error ? err.message : "Failed to load bandarmology data");
+        } finally {
+            setLoading(false);
+        }
+    };
+
+    // Fetch dates + initial data on mount
+    const mountedRef = React.useRef(false);
+    useEffect(() => {
+        const init = async () => {
+            try {
+                const result = await bandarmologyApi.getDates();
+                if (result.dates && result.dates.length > 0) {
+                    setAvailableDates(result.dates);
+                }
+            } catch (e) {
+                console.error("Failed to fetch bandarmology dates", e);
+            }
+            await loadData();
+        };
+        init();
+        mountedRef.current = true;
+    }, []);
+
+    // Reload when selectedDate changes (skip initial mount)
+    useEffect(() => {
+        if (mountedRef.current) {
+            loadData();
+        }
+    }, [selectedDate]);
+
+    // Deep analysis polling
+    const startDeepPolling = useCallback(() => {
+        if (deepPollRef.current) clearInterval(deepPollRef.current);
+        deepPollRef.current = setInterval(async () => {
+            try {
+                const status = await bandarmologyApi.getDeepStatus();
+                setDeepStatus(status);
+                if (!status.running) {
+                    if (deepPollRef.current) clearInterval(deepPollRef.current);
+                    deepPollRef.current = null;
+                    // Reload data to get enriched results
+                    await loadData();
+                }
+            } catch (e) {
+                console.error('Deep poll error', e);
+            }
+        }, 3000);
+    }, [selectedDate]);
+
+    useEffect(() => {
+        return () => {
+            if (deepPollRef.current) clearInterval(deepPollRef.current);
+        };
+    }, []);
+
+    // Persist column visibility to localStorage
+    useEffect(() => {
+        if (typeof window !== 'undefined') {
+            localStorage.setItem('bandarmology_yahoo_columns', JSON.stringify(visibleColumns));
+        }
+    }, [visibleColumns]);
+
+    // Handle click outside to close column menu
+    useEffect(() => {
+        const handleClickOutside = (event: MouseEvent) => {
+            if (columnMenuRef.current && !columnMenuRef.current.contains(event.target as Node)) {
+                setColumnMenuOpen(false);
+            }
+        };
+        document.addEventListener('mousedown', handleClickOutside);
+        return () => document.removeEventListener('mousedown', handleClickOutside);
+    }, []);
+
+    const handleManualDeep = async () => {
+        if (!manualTicker.trim()) return;
+        setManualDeepLoading(true);
+        setError(null);
+        try {
+            await bandarmologyApi.triggerDeepAnalysisTickers(
+                manualTicker.trim(),
+                selectedDate || undefined,
+                deepConcurrency,
+                forceDeepAnalyze
+            );
+            setManualTicker('');
+            startDeepPolling();
+            const status = await bandarmologyApi.getDeepStatus();
+            setDeepStatus(status);
+        } catch (err: unknown) {
+            setError(err instanceof Error ? err.message : 'Failed to trigger manual deep analysis');
+        } finally {
+            setManualDeepLoading(false);
+        }
+    };
+
+    const handleTriggerDeep = async () => {
+        setDeepLoading(true);
+        try {
+            await bandarmologyApi.triggerDeepAnalysis(
+                selectedDate || undefined,
+                deepTopN,
+                20,
+                deepConcurrency,
+                forceDeepAnalyze
+            );
+            startDeepPolling();
+            const status = await bandarmologyApi.getDeepStatus();
+            setDeepStatus(status);
+        } catch (err: unknown) {
+            setError(err instanceof Error ? err.message : 'Failed to trigger deep analysis');
+        } finally {
+            setDeepLoading(false);
+        }
+    };
+
+    const handleYahooRefresh = async () => {
+        setYahooRefreshing(true);
+        setError(null);
+        setYahooRefreshResult(null);
+        try {
+            const result = await schedulerApi.manualBandarmologyYahooRefresh({
+                limit: yahooTopN,
+                concurrency: 4
+            });
+            setYahooRefreshResult(result);
+            await loadData();
+        } catch (err: unknown) {
+            setYahooRefreshResult({
+                status: 'failed',
+                error: err instanceof Error ? err.message : 'Failed to refresh Yahoo Finance cache'
+            });
+            setError(err instanceof Error ? err.message : 'Failed to refresh Yahoo Finance cache');
+        } finally {
+            setYahooRefreshing(false);
+        }
+    };
+
+    const compareValues = useCallback((a: unknown, b: unknown, direction: SortDirection) => {
+        const order = direction === 'asc' ? 1 : -1;
+
+        const toNumber = (value: unknown): number | null => {
+            if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+            if (typeof value === 'string') {
+                const parsed = Number.parseFloat(value);
+                return Number.isNaN(parsed) ? null : parsed;
+            }
+            return null;
+        };
+
+        const numA = toNumber(a);
+        const numB = toNumber(b);
+        if (numA !== null && numB !== null) {
+            if (numA === numB) return 0;
+            return numA > numB ? order : -order;
+        }
+
+        const strA = String(a ?? '').toLowerCase();
+        const strB = String(b ?? '').toLowerCase();
+        if (strA === strB) return 0;
+        return strA > strB ? order : -order;
+    }, []);
+
+    // Processing pipeline: filter → sort → paginate
+    const processedData = useMemo(() => {
+        let result = [...data];
+
+        const getConfluenceCount = (row: BandarmologyItem): number => {
+            if (Array.isArray(row.positive_methods)) {
+                return row.positive_methods.length;
+            }
+            if (row.confluence_status === 'TRIPLE') return 3;
+            if (row.confluence_status === 'DOUBLE') return 2;
+            if (row.confluence_status === 'SINGLE') return 1;
+            return 0;
+        };
+
+        // Backtest strategy preset filter
+        if (strategyPreset === 'METHOD_1') {
+            result = result.filter((r) => (
+                (r.combined_score ?? r.total_score ?? 0) >= 160
+                && (r.deep_score ?? 0) >= 100
+                && (r.pump_tomorrow_score ?? 0) >= 80
+                && (r.breakout_probability ?? 0) >= 60
+            ));
+        } else if (strategyPreset === 'METHOD_2') {
+            result = result.filter((r) => {
+                const confl = getConfluenceCount(r);
+                const mmCum = r.txn_mm_cum ?? 0;
+                const fCum = r.txn_foreign_cum ?? 0;
+                return (
+                    (r.pump_tomorrow_score ?? 0) >= 80
+                    && (r.breakout_probability ?? 0) >= 66
+                    && confl >= 2
+                    && (r.d_0_mm ?? 0) > 0
+                    && (r.d_0_nr ?? 0) > 0
+                    && (r.d_0_ff ?? 0) > 0
+                    && (mmCum > 0 || fCum > 0)
+                );
+            });
+        }
+
+        // Score filter
+        if (minScoreFilter > 0) {
+            result = result.filter(r => r.total_score >= minScoreFilter);
+        }
+
+        // Trade type filter
+        if (tradeTypeFilter) {
+            if (tradeTypeFilter === 'SWING') {
+                result = result.filter(r => r.trade_type === 'SWING' || r.trade_type === 'BOTH');
+            } else if (tradeTypeFilter === 'INTRADAY') {
+                result = result.filter(r => r.trade_type === 'INTRADAY' || r.trade_type === 'BOTH');
+            } else {
+                result = result.filter(r => r.trade_type === tradeTypeFilter);
+            }
+        }
+
+        // Ticker search
+        if (searchTicker) {
+            const query = searchTicker.toUpperCase();
+            result = result.filter(r => r.symbol.includes(query));
+        }
+
+        // Flag filters (pinky, crossing, unusual, likuid)
+        if (flagFilters.pinky) result = result.filter(r => r.pinky);
+        if (flagFilters.crossing) result = result.filter(r => r.crossing);
+        if (flagFilters.unusual) result = result.filter(r => r.unusual);
+        if (flagFilters.likuid) result = result.filter(r => r.likuid);
+
+        // Sort
+        if (sortConfig) {
+            result.sort((a, b) => {
+                return compareValues(a[sortConfig.key], b[sortConfig.key], sortConfig.direction);
+            });
+        }
+
+        return result;
+    }, [data, strategyPreset, minScoreFilter, tradeTypeFilter, searchTicker, flagFilters, sortConfig, compareValues]);
+
+    // Pagination
+    const totalPages = Math.ceil(processedData.length / pageSize);
+    const paginatedData = useMemo(() => {
+        const start = (currentPage - 1) * pageSize;
+        return processedData.slice(start, start + pageSize);
+    }, [processedData, currentPage]);
+
+    // Reset page on filter change
+    useEffect(() => {
+        setCurrentPage(1);
+    }, [strategyPreset, minScoreFilter, tradeTypeFilter, searchTicker, flagFilters, selectedDate]);
+
+    const handleSort = (key: keyof BandarmologyItem) => {
+        setSortConfig(prev => {
+            if (!prev || prev.key !== key) {
+                return { key, direction: 'desc' };
+            }
+
+            if (prev.direction === 'desc') {
+                return { key, direction: 'asc' };
+            }
+
+            return null;
+        });
+    };
+
+    const toggleFlagFilter = (flag: string) => {
+        setFlagFilters(prev => ({ ...prev, [flag]: !prev[flag] }));
+    };
+
+    // Stats
+    const stats = useMemo(() => {
+        const swing = data.filter(d => d.trade_type === 'SWING' || d.trade_type === 'BOTH').length;
+        const intraday = data.filter(d => d.trade_type === 'INTRADAY' || d.trade_type === 'BOTH').length;
+        const high = data.filter(d => (d.combined_score ?? d.total_score) >= 60).length;
+        const triple = data.filter(d => d.confluence_status === 'TRIPLE').length;
+        const deepCount = data.filter(d => (d.deep_score ?? 0) > 0).length;
+        return { swing, intraday, high, triple, deepCount };
+    }, [data]);
+
+    const handleExportCSV = () => {
+        if (processedData.length === 0) return;
+        const headers = ['Symbol', 'Score', 'Type', 'Pinky', 'Crossing', 'Unusual', 'Likuid', 'Confluence',
+            'Price', '%1d', 'MA>', 'W-4', 'W-3', 'W-2', 'W-1', 'D-0 MM', 'D-0 NR', 'D-0 FF',
+            'Inst Net', 'Foreign Net', 'Top Buyer', 'Top Seller',
+            'Float %', 'Float Level', 'Power Score', 'Power Rating', 'Volume Ratio', 'Volume Signal', 'Days to Earnings'];
+        const rows = processedData.map(r => [
+            r.symbol, r.total_score, r.trade_type,
+            r.pinky ? 'V' : '', r.crossing ? 'V' : '', r.unusual ? 'V' : '', r.likuid ? 'V' : '',
+            r.confluence_status, r.price, r.pct_1d, r.ma_above_count,
+            r.w_4, r.w_3, r.w_2, r.w_1, r.d_0_mm, r.d_0_nr, r.d_0_ff,
+            r.inst_net_lot, r.foreign_net_lot, r.top_buyer || '', r.top_seller || '',
+            r.yahoo_finance?.float_control_pct ?? '',
+            r.yahoo_finance?.float_level ?? '',
+            r.yahoo_finance?.power_score ?? '',
+            r.yahoo_finance?.power_rating ?? '',
+            r.yahoo_finance?.volume_ratio ?? '',
+            r.yahoo_finance?.volume_signal ?? '',
+            r.yahoo_finance?.days_to_earnings ?? ''
+        ]);
+        const csv = [headers.join(','), ...rows.map(r => r.join(','))].join('\n');
+        const blob = new Blob([csv], { type: 'text/csv' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `bandarmology_${analysisDate || 'latest'}.csv`;
+        a.click();
+        URL.revokeObjectURL(url);
+    };
+
+    const SortableHeader = ({ label, sortKey, className = "" }: { label: string; sortKey: keyof BandarmologyItem; className?: string }) => {
+        const isSorted = sortConfig?.key === sortKey;
+        return (
+            <th
+                onClick={() => handleSort(sortKey)}
+                className={cn(
+                    "sticky top-0 z-20 bg-[#1a1f2b] px-1.5 py-2 text-[10px] font-bold uppercase tracking-tight cursor-pointer hover:bg-zinc-700/50 transition-colors select-none whitespace-nowrap border-r border-zinc-700/30",
+                    className
+                )}
+                title="Klik untuk ubah sort"
+            >
+                <div className="flex items-center justify-center gap-0.5">
+                    {label}
+                    <div className="flex flex-col">
+                        <ChevronUp className={cn("w-2 h-2 opacity-20", isSorted && sortConfig?.direction === 'asc' && "opacity-100 text-blue-400")} />
+                        <ChevronDown className={cn("w-2 h-2 -mt-0.5 opacity-20", isSorted && sortConfig?.direction === 'desc' && "opacity-100 text-blue-400")} />
+                    </div>
+                </div>
+            </th>
+        );
+    };
+
+    return (
+        <>
+        <div className="flex h-full min-h-0 flex-col gap-0 bg-[#0f1115] text-zinc-100 font-mono">
+            {/* Header Bar */}
+            <div className="sticky top-0 z-40 border-b border-zinc-800/60 bg-[#181a1f]/95 shadow-[0_6px_18px_rgba(0,0,0,0.35)] backdrop-blur-md">
+                <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-2 p-2">
+                    <div className="flex flex-wrap items-center gap-2 lg:gap-3">
+                        <div className="flex items-center gap-2">
+                            <Target className="w-5 h-5 text-purple-400" />
+                            <h1 className="text-[16px] font-black tracking-tight text-zinc-100">
+                                BANDARMOLOGY
+                            </h1>
+                        </div>
+
+                        {/* Strategy Preset */}
+                        <div className="space-y-0">
+                            <label className="text-[8px] text-zinc-500 font-bold uppercase tracking-wider block">Strategy</label>
+                            <div className="flex gap-1">
+                                <button
+                                    onClick={() => setStrategyPreset('NONE')}
+                                    className={cn(
+                                        "px-1.5 py-0.5 rounded text-[9px] font-bold uppercase border transition-all",
+                                        strategyPreset === 'NONE'
+                                            ? "bg-zinc-700/80 border-zinc-500/70 text-zinc-100"
+                                            : "bg-zinc-800/50 border-zinc-700/30 text-zinc-500 hover:text-zinc-300"
+                                    )}
+                                >
+                                    ALL
+                                </button>
+                                <button
+                                    onClick={() => setStrategyPreset('METHOD_1')}
+                                    className={cn(
+                                        "px-1.5 py-0.5 rounded text-[9px] font-bold uppercase border transition-all",
+                                        strategyPreset === 'METHOD_1'
+                                            ? "bg-emerald-500/20 border-emerald-500/60 text-emerald-300"
+                                            : "bg-zinc-800/50 border-zinc-700/30 text-zinc-500 hover:text-zinc-300"
+                                    )}
+                                    title="Combined>=160, Deep>=100, Pump>=80, Breakout>=60"
+                                >
+                                    M1
+                                </button>
+                                <button
+                                    onClick={() => setStrategyPreset('METHOD_2')}
+                                    className={cn(
+                                        "px-1.5 py-0.5 rounded text-[9px] font-bold uppercase border transition-all",
+                                        strategyPreset === 'METHOD_2'
+                                            ? "bg-cyan-500/20 border-cyan-500/60 text-cyan-300"
+                                            : "bg-zinc-800/50 border-zinc-700/30 text-zinc-500 hover:text-zinc-300"
+                                    )}
+                                    title="Pump>=80, Breakout>=66, CONFL>=2, D-0 MM/NR/FF > 0, (MM.CUM>0 OR F.CUM>0)"
+                                >
+                                    M2
+                                </button>
+                            </div>
+                        </div>
+                        <div className="hidden lg:block h-5 w-px bg-zinc-700" />
+
+                        {/* Date Selector */}
+                        <div className="space-y-0">
+                            <label className="text-[8px] text-zinc-500 font-bold uppercase tracking-wider block flex items-center gap-0.5">
+                                <Calendar className="w-2 h-2" /> Tanggal
+                            </label>
+                            <select
+                                value={selectedDate}
+                                onChange={(e) => setSelectedDate(e.target.value)}
+                                className="block w-32 bg-[#23252b] border border-zinc-700/50 text-yellow-400 font-bold text-[10px] rounded-sm py-0.5 px-1 outline-none focus:border-yellow-500/50 cursor-pointer"
+                            >
+                                <option value="">Latest</option>
+                                {availableDates.map(date => (
+                                    <option key={date} value={date}>{date}</option>
+                                ))}
+                            </select>
+                        </div>
+
+                        {/* Trade Type Filter */}
+                        <div className="space-y-0">
+                            <label className="text-[8px] text-zinc-500 font-bold uppercase tracking-wider block">Tipe</label>
+                            <select
+                                value={tradeTypeFilter}
+                                onChange={(e) => setTradeTypeFilter(e.target.value)}
+                                className="block w-28 bg-[#23252b] border border-zinc-700/50 text-zinc-200 text-[10px] rounded-sm py-0.5 px-1 outline-none focus:border-blue-500/50 cursor-pointer"
+                            >
+                                <option value="">All Types</option>
+                                <option value="BOTH">Swing + Intra</option>
+                                <option value="SWING">Swing</option>
+                                <option value="INTRADAY">Intraday</option>
+                                <option value="WATCH">Watch</option>
+                            </select>
+                        </div>
+
+                        {/* Min Score */}
+                        <div className="space-y-0">
+                            <label className="text-[8px] text-zinc-500 font-bold uppercase tracking-wider block">Min Score</label>
+                            <select
+                                value={minScoreFilter}
+                                onChange={(e) => setMinScoreFilter(Number(e.target.value))}
+                                className="block w-16 bg-[#23252b] border border-zinc-700/50 text-zinc-200 text-[10px] rounded-sm py-0.5 px-1 outline-none focus:border-blue-500/50 cursor-pointer"
+                            >
+                                <option value={0}>0+</option>
+                                <option value={20}>20+</option>
+                                <option value={30}>30+</option>
+                                <option value={40}>40+</option>
+                                <option value={50}>50+</option>
+                                <option value={60}>60+</option>
+                                <option value={70}>70+</option>
+                            </select>
+                        </div>
+
+                        {/* Ticker Search */}
+                        <div className="space-y-0">
+                            <label className="text-[8px] text-zinc-500 font-bold uppercase tracking-wider block">Ticker</label>
+                            <input
+                                type="text"
+                                value={searchTicker}
+                                onChange={(e) => setSearchTicker(e.target.value)}
+                                placeholder="Search..."
+                                className="block w-24 bg-[#23252b] border border-zinc-700/50 text-zinc-200 text-[10px] rounded-sm py-0.5 px-1.5 outline-none focus:border-blue-500/50 placeholder:text-zinc-700"
+                            />
+                        </div>
+
+                        {/* Flag Filters */}
+                        <div className="flex gap-1 items-end">
+                            {(['pinky', 'crossing', 'unusual', 'likuid'] as const).map(flag => (
+                                <button
+                                    key={flag}
+                                    onClick={() => toggleFlagFilter(flag)}
+                                    className={cn(
+                                        "px-1.5 py-0.5 rounded text-[9px] font-bold uppercase border transition-all",
+                                        flagFilters[flag]
+                                            ? "bg-pink-500/20 border-pink-500/50 text-pink-300"
+                                            : "bg-zinc-800/50 border-zinc-700/30 text-zinc-500 hover:text-zinc-300"
+                                    )}
+                                >
+                                    {flag === 'likuid' ? 'LQ' : flag.slice(0, 2).toUpperCase()}
+                                </button>
+                            ))}
+                        </div>
+
+                        <div className="hidden lg:block h-5 w-px bg-zinc-700" />
+
+                        {/* Column Toggle Dropdown */}
+                        <div className="relative" ref={columnMenuRef}>
+                            <button
+                                onClick={() => setColumnMenuOpen(!columnMenuOpen)}
+                                className={cn(
+                                    "flex items-center gap-1 px-2 py-1 rounded text-[9px] font-bold uppercase border transition-all",
+                                    columnMenuOpen || Object.values(visibleColumns).some(v => !v)
+                                        ? "bg-purple-500/20 border-purple-500/50 text-purple-300"
+                                        : "bg-zinc-800/50 border-zinc-700/30 text-zinc-500 hover:text-zinc-300"
+                                )}
+                                title="Toggle Yahoo Finance columns"
+                            >
+                                <Settings2 className="w-3 h-3" />
+                                Kolom YF
+                                {Object.values(visibleColumns).some(v => !v) && (
+                                    <span className="ml-0.5 w-1.5 h-1.5 rounded-full bg-purple-400" />
+                                )}
+                            </button>
+
+                            {columnMenuOpen && (
+                                <div className="absolute top-full left-0 mt-1 w-40 bg-zinc-800 border border-zinc-700 rounded-md shadow-lg z-50 py-1">
+                                    <div className="px-3 py-1 text-[9px] text-zinc-500 uppercase font-bold border-b border-zinc-700/50">
+                                        Yahoo Finance
+                                    </div>
+                                    {[
+                                        { key: 'float', label: 'Float Control', icon: '●' },
+                                        { key: 'power', label: 'Power Score', icon: '★' },
+                                        { key: 'volume', label: 'Volume', icon: '📊' },
+                                        { key: 'earnings', label: 'Earnings', icon: '📅' },
+                                    ].map(({ key, label, icon }) => (
+                                        <button
+                                            key={key}
+                                            onClick={() => setVisibleColumns(prev => ({ ...prev, [key]: !prev[key as keyof typeof prev] }))}
+                                            className="w-full flex items-center gap-2 px-3 py-1.5 text-[10px] text-zinc-300 hover:bg-zinc-700/50 transition-colors"
+                                        >
+                                            <input
+                                                type="checkbox"
+                                                checked={visibleColumns[key as keyof typeof visibleColumns]}
+                                                onChange={() => {}}
+                                                className="w-3 h-3 rounded border-zinc-600 bg-zinc-700 text-purple-500 focus:ring-purple-500/30"
+                                            />
+                                            <span>{icon}</span>
+                                            <span>{label}</span>
+                                        </button>
+                                    ))}
+                                </div>
+                            )}
+                        </div>
+                    </div>
+
+                    <div className="flex flex-wrap items-center gap-2 w-full lg:w-auto">
+                        {/* Manual Deep Analyze */}
+                        <div className="flex items-center gap-1">
+                            <input
+                                type="text"
+                                value={manualTicker}
+                                onChange={(e) => setManualTicker(e.target.value.toUpperCase())}
+                                onKeyDown={(e) => { if (e.key === 'Enter') handleManualDeep(); }}
+                                placeholder="BBCA,BMRI"
+                                className="w-28 bg-[#23252b] border border-zinc-700/50 text-zinc-200 text-[10px] rounded-sm py-1 px-1.5 outline-none focus:border-amber-500/50 placeholder:text-zinc-700 font-mono"
+                                title="Ketik kode emiten (pisah koma) lalu klik Deep atau Enter"
+                            />
+                            <button
+                                onClick={handleManualDeep}
+                                disabled={!manualTicker.trim() || manualDeepLoading || (deepStatus?.running ?? false)}
+                                className="bg-gradient-to-r from-cyan-600 to-blue-600 hover:opacity-90 disabled:opacity-50 text-white px-2 py-1 rounded-sm text-[10px] font-bold shadow-lg transition-all active:scale-95 flex items-center gap-1"
+                                title="Deep analyze emiten yang diketik manual"
+                            >
+                                {manualDeepLoading ? <Loader2 className="w-2.5 h-2.5 animate-spin" /> : <Search className="w-2.5 h-2.5" />}
+                                Deep
+                            </button>
+                        </div>
+                        <div className="hidden lg:block h-5 w-px bg-zinc-700" />
+                        <div className="flex items-center gap-1">
+                            <div className="space-y-0">
+                                <label className="text-[8px] text-zinc-500 font-bold uppercase tracking-wider block">Top N</label>
+                                <select
+                                    value={deepTopN}
+                                    onChange={(e) => setDeepTopN(Number(e.target.value))}
+                                    disabled={deepStatus?.running ?? false}
+                                    className="block w-16 bg-[#23252b] border border-amber-700/50 text-amber-300 font-bold text-[10px] rounded-sm py-0.5 px-1 outline-none focus:border-amber-500/50 cursor-pointer disabled:opacity-50"
+                                >
+                                    <option value={30}>30</option>
+                                    <option value={50}>50</option>
+                                    <option value={100}>100</option>
+                                    <option value={200}>200</option>
+                                    <option value={500}>500</option>
+                                </select>
+                            </div>
+                            <div className="space-y-0">
+                                <label className="text-[8px] text-zinc-500 font-bold uppercase tracking-wider block">Worker</label>
+                                <select
+                                    value={deepConcurrency}
+                                    onChange={(e) => setDeepConcurrency(Number(e.target.value))}
+                                    disabled={deepStatus?.running ?? false}
+                                    className="block w-16 bg-[#23252b] border border-cyan-700/50 text-cyan-300 font-bold text-[10px] rounded-sm py-0.5 px-1 outline-none focus:border-cyan-500/50 cursor-pointer disabled:opacity-50"
+                                >
+                                    <option value={1}>1</option>
+                                    <option value={2}>2</option>
+                                    <option value={4}>4</option>
+                                    <option value={6}>6</option>
+                                    <option value={8}>8</option>
+                                    <option value={12}>12</option>
+                                </select>
+                            </div>
+                            <div className="flex items-center gap-1 mt-3">
+                                <Checkbox
+                                    id="force-deep"
+                                    checked={forceDeepAnalyze}
+                                    onCheckedChange={(checked) => setForceDeepAnalyze(checked === true)}
+                                    disabled={deepStatus?.running ?? false}
+                                />
+                                <label
+                                    htmlFor="force-deep"
+                                    className="text-[10px] text-zinc-400 cursor-pointer select-none"
+                                    title="Paksa analisis ulang meskipun sudah ada cache"
+                                >
+                                    Force
+                                </label>
+                            </div>
+                            <button
+                                onClick={handleTriggerDeep}
+                                disabled={loading || deepLoading || (deepStatus?.running ?? false)}
+                                className="bg-gradient-to-r from-amber-600 to-orange-600 hover:opacity-90 disabled:opacity-50 text-white px-3 py-1 rounded-sm text-[10px] font-bold shadow-lg transition-all active:scale-95 flex items-center gap-1 mt-3"
+                                title={`Scrape inventory + transaction chart for top ${deepTopN} stocks`}
+                            >
+                                {deepStatus?.running ? (
+                                    <><Loader2 className="w-2.5 h-2.5 animate-spin" /> Deep {deepStatus.progress}/{deepStatus.total}</>
+                                ) : (
+                                    <><Microscope className="w-2.5 h-2.5" /> Deep Analyze</>
+                                )}
+                            </button>
+                        </div>
+                        <div className="hidden lg:block h-5 w-px bg-zinc-700" />
+                        <div className="flex items-center gap-1">
+                            <div className="space-y-0">
+                                <label className="text-[8px] text-zinc-500 font-bold uppercase tracking-wider block">YF Top N</label>
+                                <select
+                                    value={yahooTopN}
+                                    onChange={(e) => setYahooTopN(Number(e.target.value))}
+                                    disabled={yahooRefreshing}
+                                    className="block w-16 bg-[#23252b] border border-emerald-700/50 text-emerald-300 font-bold text-[10px] rounded-sm py-0.5 px-1 outline-none focus:border-emerald-500/50 cursor-pointer disabled:opacity-50"
+                                >
+                                    <option value={50}>50</option>
+                                    <option value={100}>100</option>
+                                    <option value={200}>200</option>
+                                    <option value={300}>300</option>
+                                    <option value={500}>500</option>
+                                </select>
+                            </div>
+                            <button
+                                onClick={handleYahooRefresh}
+                                disabled={yahooRefreshing}
+                                className="bg-gradient-to-r from-emerald-600 to-teal-600 hover:opacity-90 disabled:opacity-50 text-white px-3 py-1 rounded-sm text-[10px] font-bold shadow-lg transition-all active:scale-95 flex items-center gap-1 mt-3"
+                                title={`Refresh Yahoo Finance cache for top ${yahooTopN} tickers`}
+                            >
+                                {yahooRefreshing ? (
+                                    <><Loader2 className="w-2.5 h-2.5 animate-spin" /> YF Refresh</>
+                                ) : (
+                                    <><RefreshCcw className="w-2.5 h-2.5" /> YF Refresh</>
+                                )}
+                            </button>
+                        </div>
+                        <button
+                            onClick={() => loadData()}
+                            disabled={loading}
+                            className="bg-gradient-to-r from-purple-600 to-blue-600 hover:opacity-90 disabled:opacity-50 text-white px-3 py-1 rounded-sm text-[10px] font-bold shadow-lg transition-all active:scale-95 flex items-center gap-1"
+                        >
+                            {loading && <RefreshCcw className="w-2.5 h-2.5 animate-spin" />}
+                            {loading ? "Analyzing..." : "Refresh"}
+                        </button>
+                    </div>
+                </div>
+
+                {yahooRefreshing && (
+                    <div className="px-3 py-1 text-[9px] text-emerald-300 border-t border-zinc-800/50 bg-[#10151d]">
+                        YF Refresh running...
+                    </div>
+                )}
+
+                {!yahooRefreshing && yahooRefreshResult && (
+                    <div className="px-3 py-1 text-[9px] border-t border-zinc-800/50 bg-[#10151d]">
+                        {yahooRefreshResult.status !== 'success' ? (
+                            <span className="text-red-400 font-bold">
+                                YF Refresh failed{yahooRefreshResult.error ? `: ${yahooRefreshResult.error}` : ''}
+                            </span>
+                        ) : (
+                            <div className="flex flex-wrap gap-2 items-center text-zinc-300">
+                                <span className="text-emerald-400 font-bold">YF Refresh OK</span>
+                                <span>Tickers: <span className="font-bold text-zinc-100">{yahooRefreshResult.total_tickers ?? 0}</span></span>
+                                <span>Float <span className="font-bold text-emerald-400">{yahooRefreshResult.totals?.float_ok ?? 0}</span>/<span className="font-bold text-red-400">{yahooRefreshResult.totals?.float_fail ?? 0}</span></span>
+                                <span>Power <span className="font-bold text-emerald-400">{yahooRefreshResult.totals?.power_ok ?? 0}</span>/<span className="font-bold text-red-400">{yahooRefreshResult.totals?.power_fail ?? 0}</span></span>
+                                <span>Vol <span className="font-bold text-emerald-400">{yahooRefreshResult.totals?.volume_ok ?? 0}</span>/<span className="font-bold text-red-400">{yahooRefreshResult.totals?.volume_fail ?? 0}</span></span>
+                                <span>Earn <span className="font-bold text-emerald-400">{yahooRefreshResult.totals?.earnings_ok ?? 0}</span>/<span className="font-bold text-red-400">{yahooRefreshResult.totals?.earnings_fail ?? 0}</span></span>
+                                <span>Errors <span className="font-bold text-amber-400">{yahooRefreshResult.errors?.length ?? 0}</span></span>
+                            </div>
+                        )}
+                    </div>
+                )}
+
+                {deepStatus && (
+                    <div className="flex items-center gap-3 px-3 py-1 bg-[#10151d] border-t border-zinc-800/50 text-[9px] overflow-x-auto scrollbar-none">
+                        <span className="text-zinc-500">DEEP STATUS:</span>
+                        <span className="text-zinc-300">REQ <span className="font-bold">{deepStatus.requested ?? deepStatus.total}</span></span>
+                        <span className="text-zinc-300">QUAL <span className="font-bold text-emerald-400">{deepStatus.qualified ?? deepStatus.total}</span></span>
+                        <span className="text-zinc-300">PROC <span className="font-bold text-cyan-400">{deepStatus.processed ?? deepStatus.completed_tickers?.length ?? 0}</span></span>
+                        <span className="text-zinc-300">FAIL <span className="font-bold text-red-400">{deepStatus.failed ?? deepStatus.failed_tickers?.length ?? 0}</span></span>
+                        <span className="text-zinc-300">FRESH <span className="font-bold text-amber-400">{deepStatus.already_fresh_today ?? deepStatus.fresh_tickers?.length ?? 0}</span></span>
+                        <span className="text-zinc-300">WORKER <span className="font-bold text-cyan-300">{deepStatus.concurrency ?? deepConcurrency}</span></span>
+                        {deepStatus.retry_waiting_count !== undefined && (
+                            <span className="text-zinc-300">Retrying: <span className="font-bold text-amber-400">{deepStatus.retry_waiting_count ?? 0}</span></span>
+                        )}
+                        {deepStatus.non_retryable_skips !== undefined && (
+                            <span className="text-zinc-300">Non-retryable skips: <span className="font-bold text-red-400">{deepStatus.non_retryable_skips?.length ?? 0}</span></span>
+                        )}
+                        {deepStatus.retry_exhausted !== undefined && (
+                            <span className="text-zinc-300">Retry exhausted: <span className="font-bold text-red-400">{deepStatus.retry_exhausted?.length ?? 0}</span></span>
+                        )}
+                        {deepStatus.running && deepStatus.active_tickers && deepStatus.active_tickers.length > 0 && (
+                            <span className="text-zinc-500">ACTIVE: <span className="text-zinc-300 font-bold">{deepStatus.active_tickers.join(', ')}</span></span>
+                        )}
+                    </div>
+                )}
+
+                {/* Stats Bar */}
+                <div className="flex items-center gap-3 lg:gap-4 px-3 py-1 bg-[#12141a] border-t border-zinc-800/40 text-[9px] overflow-x-auto scrollbar-none">
+                    <div className="flex items-center gap-1.5 text-cyan-300">
+                        <ArrowUpDown className="w-2.5 h-2.5" />
+                        <span className="font-bold">SORT: KLIK HEADER KOLOM</span>
+                    </div>
+                    <div className="flex items-center gap-1.5">
+                        <span className="text-zinc-500">TOTAL:</span>
+                        <span className="text-zinc-300 font-bold">{processedData.length}</span>
+                    </div>
+                    <div className="flex items-center gap-1.5">
+                        <TrendingUp className="w-2.5 h-2.5 text-emerald-500" />
+                        <span className="text-zinc-500">SWING:</span>
+                        <span className="text-emerald-400 font-bold">{stats.swing}</span>
+                    </div>
+                    <div className="flex items-center gap-1.5">
+                        <Zap className="w-2.5 h-2.5 text-cyan-500" />
+                        <span className="text-zinc-500">INTRADAY:</span>
+                        <span className="text-cyan-400 font-bold">{stats.intraday}</span>
+                    </div>
+                    <div className="flex items-center gap-1.5">
+                        <Target className="w-2.5 h-2.5 text-yellow-500" />
+                        <span className="text-zinc-500">HIGH SCORE (60+):</span>
+                        <span className="text-yellow-400 font-bold">{stats.high}</span>
+                    </div>
+                    <div className="flex items-center gap-1.5">
+                        <span className="text-zinc-500">TRIPLE CONFLUENCE:</span>
+                        <span className="text-yellow-400 font-bold">{stats.triple}</span>
+                    </div>
+                    {stats.deepCount > 0 && (
+                        <div className="flex items-center gap-1.5">
+                            <Microscope className="w-2.5 h-2.5 text-amber-500" />
+                            <span className="text-zinc-500">DEEP:</span>
+                            <span className="text-amber-400 font-bold">{stats.deepCount}</span>
+                        </div>
+                    )}
+                    {analysisDate && (
+                        <div className="ml-auto text-zinc-500">
+                            DATA: <span className="text-zinc-300 font-bold">{analysisDate}</span>
+                        </div>
+                    )}
+                </div>
+            </div>
+
+            {/* Data Freshness Warning Banner */}
+            {processedData.some(r => (r.data_freshness ?? 1) < 1) && (
+                <div className="bg-amber-900/30 border-y border-amber-700/30 px-3 py-1.5 flex items-center gap-2">
+                    <AlertCircle className="w-3 h-3 text-amber-500" />
+                    <span className="text-[10px] text-amber-400">
+                        Some stocks have stale data. Check freshness indicator in details.
+                    </span>
+                </div>
+            )}
+
+            {/* Table */}
+            <div className="relative min-h-[300px] flex-1 min-h-0 overflow-hidden bg-[#0f1115]">
+                {loading && (
+                    <div className="absolute inset-0 bg-black/60 backdrop-blur-sm z-30 flex flex-col items-center justify-center gap-3">
+                        <RefreshCcw className="w-10 h-10 text-purple-500 animate-spin" />
+                        <span className="text-purple-400 text-xs font-mono animate-pulse">
+                            Running Bandarmology Analysis...
+                        </span>
+                    </div>
+                )}
+
+                <div className="h-full min-h-0 overflow-auto scrollbar-thin scrollbar-thumb-zinc-800 scrollbar-track-transparent">
+                    <table className="hidden w-auto table-fixed border-separate border-spacing-0 text-left text-[11px] leading-none tracking-tight lg:table">
+                        <thead className="sticky top-0 z-30 shadow-md">
+                            <tr className="border-b border-purple-500/40 bg-gradient-to-r from-[#2a173d] to-[#16243d] text-zinc-200">
+                                <SortableHeader label="#" sortKey="total_score" className="w-[30px]" />
+                                <SortableHeader label="TICKER" sortKey="symbol" className="w-[80px]" />
+                                <SortableHeader label="SCORE" sortKey="combined_score" className="w-[90px]" />
+                                <SortableHeader label="DEEP" sortKey="deep_score" className="w-[50px]" />
+                                <SortableHeader label="BRK PROB" sortKey="breakout_probability" className="w-[70px]" />
+                                <SortableHeader label="PUMP TMRW" sortKey="pump_tomorrow_score" className="w-[70px]" />
+                                <SortableHeader label="TYPE" sortKey="trade_type" className="w-[95px]" />
+                                <th className="sticky top-0 z-20 w-[35px] border-r border-zinc-700/30 bg-[#1a1f2b] px-1 py-2 text-center text-[10px] font-bold uppercase tracking-tight">PK</th>
+                                <th className="sticky top-0 z-20 w-[35px] border-r border-zinc-700/30 bg-[#1a1f2b] px-1 py-2 text-center text-[10px] font-bold uppercase tracking-tight">CR</th>
+                                <th className="sticky top-0 z-20 w-[35px] border-r border-zinc-700/30 bg-[#1a1f2b] px-1 py-2 text-center text-[10px] font-bold uppercase tracking-tight">UN</th>
+                                <th className="sticky top-0 z-20 w-[35px] border-r border-zinc-700/30 bg-[#1a1f2b] px-1 py-2 text-center text-[10px] font-bold uppercase tracking-tight">LQ</th>
+                                <SortableHeader label="CONFL" sortKey="confluence_status" className="w-[55px]" />
+                                <SortableHeader label="PRICE" sortKey="price" className="w-[70px]" />
+                                <SortableHeader label="%1D" sortKey="pct_1d" className="w-[55px]" />
+                                <SortableHeader label="MA>" sortKey="ma_above_count" className="w-[40px]" />
+                                <SortableHeader label="W-4" sortKey="w_4" className="w-[60px]" />
+                                <SortableHeader label="W-3" sortKey="w_3" className="w-[60px]" />
+                                <SortableHeader label="W-2" sortKey="w_2" className="w-[60px]" />
+                                <SortableHeader label="W-1" sortKey="w_1" className="w-[60px]" />
+                                <SortableHeader label="D-0 MM" sortKey="d_0_mm" className="w-[65px]" />
+                                <SortableHeader label="D-0 NR" sortKey="d_0_nr" className="w-[65px]" />
+                                <SortableHeader label="D-0 FF" sortKey="d_0_ff" className="w-[65px]" />
+                                <SortableHeader label="INST" sortKey="inst_net_lot" className="w-[65px]" />
+                                <SortableHeader label="FRGN" sortKey="foreign_net_lot" className="w-[65px]" />
+                                <SortableHeader label="INV" sortKey="inv_accum_brokers" className="w-[55px]" />
+                                <SortableHeader label="MM" sortKey="txn_mm_cum" className="w-[60px]" />
+                                <SortableHeader label="F.CUM" sortKey="txn_foreign_cum" className="w-[60px]" />
+                                <th className="sticky top-0 z-20 w-[40px] border-r border-zinc-700/30 bg-[#1a1f2b] px-1 py-2 text-center text-[10px] font-bold uppercase tracking-tight" title="Volume Confirmation">VOL</th>
+                                <th className="sticky top-0 z-20 w-[35px] border-r border-zinc-700/30 bg-[#1a1f2b] px-1 py-2 text-center text-[10px] font-bold uppercase tracking-tight" title="Data Conflict Warning">⚠️</th>
+                                <th className="sticky top-0 z-20 w-[40px] border-r border-zinc-700/30 bg-[#1a1f2b] px-1 py-2 text-center text-[10px] font-bold uppercase tracking-tight">TOP B</th>
+                                <th className="sticky top-0 z-20 w-[40px] border-r border-zinc-700/30 bg-[#1a1f2b] px-1 py-2 text-center text-[10px] font-bold uppercase tracking-tight">TOP S</th>
+                                {/* Yahoo Finance Columns */}
+                                {visibleColumns.float && (
+                                    <th className="sticky top-0 z-20 w-[70px] border-r border-zinc-700/30 bg-[#1a1f2b] px-1 py-2 text-center text-[10px] font-bold uppercase tracking-tight" title="Float Control %">FLOAT</th>
+                                )}
+                                {visibleColumns.power && (
+                                    <th className="sticky top-0 z-20 w-[70px] border-r border-zinc-700/30 bg-[#1a1f2b] px-1 py-2 text-center text-[10px] font-bold uppercase tracking-tight" title="Bandar Power Score">POWER</th>
+                                )}
+                                {visibleColumns.volume && (
+                                    <th className="sticky top-0 z-20 w-[70px] border-r border-zinc-700/30 bg-[#1a1f2b] px-1 py-2 text-center text-[10px] font-bold uppercase tracking-tight" title="Volume Ratio">VOL</th>
+                                )}
+                                {visibleColumns.earnings && (
+                                    <th className="sticky top-0 z-20 w-[60px] bg-[#1a1f2b] px-1 py-2 text-center text-[10px] font-bold uppercase tracking-tight" title="Days to Earnings">EARN</th>
+                                )}
+                                {/* Expand column */}
+                                <th className="sticky top-0 z-20 w-[30px] bg-[#1a1f2b] px-1 py-2 text-center text-[10px] font-bold uppercase tracking-tight"></th>
+                            </tr>
+                        </thead>
+
+                        {/* Desktop Table View */}
+                        <tbody className="bg-[#0f1115] divide-y divide-zinc-800/30 hidden lg:table-row-group">
+                            {paginatedData.length > 0 ? (
+                                paginatedData.map((row, idx) => {
+                                    const rank = (currentPage - 1) * pageSize + idx + 1;
+                                    const typeConfig = TRADE_TYPE_CONFIG[row.trade_type] || TRADE_TYPE_CONFIG['—'];
+                                    const conflConfig = CONFLUENCE_CONFIG[row.confluence_status] || CONFLUENCE_CONFIG['NONE'];
+
+                                    return (
+                                        <React.Fragment key={row.symbol}>
+                                        <tr className="hover:bg-zinc-800/40 transition-colors group h-[32px]">
+                                            {/* Rank */}
+                                            <td className="px-1.5 py-1 text-center text-zinc-600 text-[10px] border-r border-zinc-800/30 font-mono">
+                                                {rank}
+                                            </td>
+
+                                            {/* Symbol */}
+                                            <td className="px-2 py-1 border-r border-zinc-800/30">
+                                                <button
+                                                    onClick={() => setSelectedTicker(row.symbol)}
+                                                    className="text-blue-300 font-black text-[12px] tracking-tight hover:text-blue-200 hover:underline cursor-pointer transition-colors"
+                                                >
+                                                    {row.symbol}
+                                                </button>
+                                            </td>
+
+                                            {/* Score (combined or base) */}
+                                            <td className="px-1.5 py-1 border-r border-zinc-800/30">
+                                                <ScoreBar score={row.combined_score ?? row.total_score} max={row.max_combined_score ?? MAX_COMBINED_SCORE} />
+                                            </td>
+
+                                            {/* Deep Score */}
+                                            <td className="px-1 py-1 text-center border-r border-zinc-800/30">
+                                                {(row.deep_score ?? 0) > 0 ? (
+                                                    <span className={cn(
+                                                        "text-[10px] font-bold tabular-nums",
+                                                        (row.deep_score ?? 0) >= 40 ? 'text-amber-400' :
+                                                        (row.deep_score ?? 0) >= 20 ? 'text-blue-400' : 'text-zinc-500'
+                                                    )}>
+                                                        +{row.deep_score}
+                                                    </span>
+                                                ) : <span className="text-zinc-800 text-[9px]">—</span>}
+                                            </td>
+
+                                            {/* Breakout Probability */}
+                                            <td className="px-1 py-1 text-center border-r border-zinc-800/30">
+                                                {(row.breakout_probability ?? 0) > 0 ? (
+                                                    <span className={cn(
+                                                        "text-[10px] font-bold tabular-nums",
+                                                        (row.breakout_probability ?? 0) >= 80 ? 'text-emerald-400' :
+                                                        (row.breakout_probability ?? 0) >= 60 ? 'text-cyan-400' :
+                                                        (row.breakout_probability ?? 0) >= 40 ? 'text-amber-400' : 'text-zinc-400'
+                                                    )}>
+                                                        {Math.round(row.breakout_probability ?? 0)}%
+                                                    </span>
+                                                ) : <span className="text-zinc-800 text-[9px]">—</span>}
+                                            </td>
+
+                                            {/* Pump Tomorrow Score */}
+                                            <td className="px-1 py-1 text-center border-r border-zinc-800/30">
+                                                {(row.pump_tomorrow_score ?? 0) > 0 ? (
+                                                    <span className={cn(
+                                                        "text-[10px] font-bold tabular-nums",
+                                                        (row.pump_tomorrow_score ?? 0) >= 80 ? 'text-emerald-400' :
+                                                        (row.pump_tomorrow_score ?? 0) >= 60 ? 'text-cyan-400' :
+                                                        (row.pump_tomorrow_score ?? 0) >= 40 ? 'text-amber-400' : 'text-zinc-400'
+                                                    )}>
+                                                        {Math.round(row.pump_tomorrow_score ?? 0)}
+                                                    </span>
+                                                ) : <span className="text-zinc-800 text-[9px]">—</span>}
+                                            </td>
+
+                                            {/* Trade Type */}
+                                            <td className="px-1 py-1 text-center border-r border-zinc-800/30">
+                                                <span className={cn(
+                                                    "text-[9px] font-black px-1.5 py-0.5 rounded border",
+                                                    typeConfig.bg, typeConfig.color
+                                                )}>
+                                                    {typeConfig.label}
+                                                </span>
+                                            </td>
+
+                                            {/* Flags */}
+                                            <td className="px-1 py-1 text-center border-r border-zinc-800/30">
+                                                <FlagBadge active={row.pinky} label="PK" />
+                                            </td>
+                                            <td className="px-1 py-1 text-center border-r border-zinc-800/30">
+                                                <FlagBadge active={row.crossing} label="CR" />
+                                            </td>
+                                            <td className="px-1 py-1 text-center border-r border-zinc-800/30">
+                                                <FlagBadge active={row.unusual} label="UN" />
+                                            </td>
+                                            <td className="px-1 py-1 text-center border-r border-zinc-800/30">
+                                                <FlagBadge active={row.likuid} label="LQ" />
+                                            </td>
+
+                                            {/* Confluence */}
+                                            <td className="px-1 py-1 text-center border-r border-zinc-800/30">
+                                                <span className={cn("text-[11px] tracking-widest", conflConfig.color)} title={`${row.confluence_status}: ${row.positive_methods.join(', ')}`}>
+                                                    {conflConfig.label}
+                                                </span>
+                                            </td>
+
+                                            {/* Price */}
+                                            <td className="px-1.5 py-1 text-right border-r border-zinc-800/30 tabular-nums text-zinc-300 font-bold text-[11px]">
+                                                {row.price > 0 ? row.price.toLocaleString('id-ID') : '—'}
+                                            </td>
+
+                                            {/* %1d */}
+                                            <td className="px-1.5 py-1 text-right border-r border-zinc-800/30">
+                                                {row.pct_1d !== 0 ? (
+                                                    <span className={cn(
+                                                        "tabular-nums font-bold text-[11px]",
+                                                        row.pct_1d > 0 ? 'text-emerald-400' : 'text-red-400'
+                                                    )}>
+                                                        {row.pct_1d > 0 ? '+' : ''}{row.pct_1d.toFixed(1)}%
+                                                    </span>
+                                                ) : <span className="text-zinc-700">0%</span>}
+                                            </td>
+
+                                            {/* MA Above Count */}
+                                            <td className="px-1 py-1 text-center border-r border-zinc-800/30">
+                                                <span className={cn(
+                                                    "text-[10px] font-bold",
+                                                    row.ma_above_count >= 4 ? 'text-emerald-400' :
+                                                    row.ma_above_count >= 2 ? 'text-blue-400' :
+                                                    row.ma_above_count >= 1 ? 'text-orange-400' : 'text-zinc-600'
+                                                )}>
+                                                    {row.ma_above_count}/5
+                                                </span>
+                                            </td>
+
+                                            {/* Weekly Accumulation */}
+                                            <td className="px-1 py-1 text-center border-r border-zinc-800/30"><FlowCell value={row.w_4} /></td>
+                                            <td className="px-1 py-1 text-center border-r border-zinc-800/30"><FlowCell value={row.w_3} /></td>
+                                            <td className="px-1 py-1 text-center border-r border-zinc-800/30"><FlowCell value={row.w_2} /></td>
+                                            <td className="px-1 py-1 text-center border-r border-zinc-800/30"><FlowCell value={row.w_1} /></td>
+
+                                            {/* Daily Flow per method */}
+                                            <td className="px-1 py-1 text-center border-r border-zinc-800/30"><FlowCell value={row.d_0_mm} /></td>
+                                            <td className="px-1 py-1 text-center border-r border-zinc-800/30"><FlowCell value={row.d_0_nr} /></td>
+                                            <td className="px-1 py-1 text-center border-r border-zinc-800/30"><FlowCell value={row.d_0_ff} /></td>
+
+                                            {/* Institutional & Foreign Net */}
+                                            <td className="px-1 py-1 text-center border-r border-zinc-800/30"><FlowCell value={row.inst_net_lot} /></td>
+                                            <td className="px-1 py-1 text-center border-r border-zinc-800/30"><FlowCell value={row.foreign_net_lot} /></td>
+
+                                            {/* Inventory Accum Brokers */}
+                                            <td className="px-1 py-1 text-center border-r border-zinc-800/30">
+                                                {(row.inv_accum_brokers ?? 0) > 0 ? (
+                                                    <span className="text-[9px] font-bold">
+                                                        <span className="text-emerald-400">{row.inv_accum_brokers}A</span>
+                                                        {(row.inv_tektok_brokers ?? 0) > 0 && (
+                                                            <span className="text-red-400 ml-0.5">{row.inv_tektok_brokers}T</span>
+                                                        )}
+                                                        {(row.inv_clean_brokers ?? 0) > 0 && (
+                                                            <span className="text-cyan-400 ml-0.5">{row.inv_clean_brokers}✓</span>
+                                                        )}
+                                                    </span>
+                                                ) : <span className="text-zinc-800 text-[9px]">—</span>}
+                                            </td>
+
+                                            {/* Txn MM Cumulative with Relative Context Tooltip */}
+                                            <td className="px-1 py-1 text-center border-r border-zinc-800/30">
+                                                {row.txn_mm_cum != null && row.txn_mm_cum !== 0 ? (
+                                                    <span
+                                                        className={cn(
+                                                            "text-[9px] font-bold tabular-nums cursor-help",
+                                                            row.txn_mm_cum > 0 ? 'text-emerald-400' : 'text-red-400'
+                                                        )}
+                                                        title={row.relative_context?.market_context ?
+                                                            `Market Context:\n` +
+                                                            `  Stock: ${row.relative_context.market_context.stock_flow?.toFixed(1)}B\n` +
+                                                            `  Market Avg: ${row.relative_context.market_context.market_avg?.toFixed(1)}B\n` +
+                                                            `  Z-Score: ${row.relative_context.market_context.z_score?.toFixed(2)}\n` +
+                                                            `  Percentile: ${row.relative_context.market_context.percentile?.toFixed(0)}%` +
+                                                            (row.relative_context.sector_context ?
+                                                                `\n\nSector (${row.relative_context.sector_context.sector}):\n` +
+                                                                `  Diff: ${row.relative_context.sector_context.diff_pct?.toFixed(1)}%` : '')
+                                                            : 'No relative context data'
+                                                        }
+                                                    >
+                                                        {row.txn_mm_cum > 0 ? '+' : ''}{row.txn_mm_cum.toFixed(0)}
+                                                        {row.relative_context?.relative_score && row.relative_context.relative_score !== 1.0 && (
+                                                            <span className="ml-0.5 text-[7px] opacity-70">
+                                                                ({row.relative_context.relative_score >= 1.1 ? '↑' : row.relative_context.relative_score <= 0.9 ? '↓' : '→'})
+                                                            </span>
+                                                        )}
+                                                    </span>
+                                                ) : <span className="text-zinc-800 text-[9px]">—</span>}
+                                            </td>
+
+                                            {/* Txn Foreign Cumulative */}
+                                            <td className="px-1 py-1 text-center border-r border-zinc-800/30">
+                                                {row.txn_foreign_cum != null && row.txn_foreign_cum !== 0 ? (
+                                                    <span className={cn(
+                                                        "text-[9px] font-bold tabular-nums",
+                                                        row.txn_foreign_cum > 0 ? 'text-emerald-400' : 'text-red-400'
+                                                    )}>
+                                                        {row.txn_foreign_cum > 0 ? '+' : ''}{row.txn_foreign_cum.toFixed(0)}
+                                                    </span>
+                                                ) : <span className="text-zinc-800 text-[9px]">—</span>}
+                                            </td>
+
+                                            {/* Volume Confirmation */}
+                                            <td className="px-1 py-1 text-center border-r border-zinc-800/30">
+                                                {(row.volume_confirmation_multiplier ?? 0) > 1 ? (
+                                                    <span className="text-[9px] font-bold text-cyan-400" title={`Volume confirms flow (${row.volume_confirmation_multiplier?.toFixed(2)}x)`}>
+                                                        ✓{row.volume_confirmation_multiplier?.toFixed(1)}x
+                                                    </span>
+                                                ) : (row.volume_confirmation_multiplier ?? 0) > 0 && (row.volume_confirmation_multiplier ?? 0) < 1 ? (
+                                                    <span className="text-[9px] font-bold text-orange-400" title={`Volume contradicts flow (${row.volume_confirmation_multiplier?.toFixed(2)}x)`}>
+                                                        !{row.volume_confirmation_multiplier?.toFixed(1)}x
+                                                    </span>
+                                                ) : (
+                                                    <span className="text-zinc-800 text-[9px]">—</span>
+                                                )}
+                                            </td>
+
+                                            {/* Conflict Warning */}
+                                            <td className="px-1 py-1 text-center border-r border-zinc-800/30">
+                                                {row.data_source_conflict ? (
+                                                    <span
+                                                        className="text-[11px] cursor-help"
+                                                        title={row.conflict_stats ?
+                                                            `Data Conflict: CV=${row.conflict_stats.cv.toFixed(2)} Sources: ${Object.keys(row.conflict_stats.sources).join(', ')}` :
+                                                            'Data sources disagree'
+                                                        }
+                                                    >
+                                                        ⚠️
+                                                    </span>
+                                                ) : (
+                                                    <span className="text-zinc-800 text-[9px]">—</span>
+                                                )}
+                                            </td>
+
+                                            {/* Top Buyer & Seller */}
+                                            <td className="px-1 py-1 text-center border-r border-zinc-800/30">
+                                                <span className="text-emerald-400 font-bold text-[10px]">{row.top_buyer || '—'}</span>
+                                            </td>
+                                            <td className="px-1 py-1 text-center border-r border-zinc-800/30">
+                                                <span className="text-red-400 font-bold text-[10px]">{row.top_seller || '—'}</span>
+                                            </td>
+
+                                            {/* Yahoo Finance Cells */}
+                                            {visibleColumns.float && (
+                                                <td className="px-1 py-1 text-center border-r border-zinc-800/30">
+                                                    <FloatCell data={row.yahoo_finance} />
+                                                </td>
+                                            )}
+                                            {visibleColumns.power && (
+                                                <td className="px-1 py-1 text-center border-r border-zinc-800/30">
+                                                    <PowerCell data={row.yahoo_finance} />
+                                                </td>
+                                            )}
+                                            {visibleColumns.volume && (
+                                                <td className="px-1 py-1 text-center border-r border-zinc-800/30">
+                                                    <VolumeCell data={row.yahoo_finance} />
+                                                </td>
+                                            )}
+                                            {visibleColumns.earnings && (
+                                                <td className="px-1 py-1 text-center border-r border-zinc-800/30">
+                                                    <EarningsCell data={row.yahoo_finance} />
+                                                </td>
+                                            )}
+
+                                            {/* Expand Row Toggle */}
+                                            <td className="px-1 py-1 text-center">
+                                                <button
+                                                    onClick={() => setExpandedRow(expandedRow === row.symbol ? null : row.symbol)}
+                                                    className={cn(
+                                                        "p-0.5 rounded transition-colors",
+                                                        expandedRow === row.symbol
+                                                            ? "bg-purple-500/30 text-purple-300"
+                                                            : "text-zinc-600 hover:text-zinc-400 hover:bg-zinc-800"
+                                                    )}
+                                                    title={expandedRow === row.symbol ? "Collapse" : "Expand Yahoo Finance details"}
+                                                >
+                                                    <ChevronRight className={cn(
+                                                        "w-4 h-4 transition-transform",
+                                                        expandedRow === row.symbol && "rotate-90"
+                                                    )} />
+                                                </button>
+                                            </td>
+                                        </tr>
+
+                                        {expandedRow === row.symbol && (
+                                            <tr className="bg-zinc-900/50">
+                                                <td
+                                                    colSpan={31 + (visibleColumns.float ? 1 : 0) + (visibleColumns.power ? 1 : 0) + (visibleColumns.volume ? 1 : 0) + (visibleColumns.earnings ? 1 : 0)}
+                                                    className="px-4 py-0 border-b border-zinc-800/30"
+                                                >
+                                                    <div className="py-3">
+                                                        <YahooFinanceDetailPanel data={row.yahoo_finance} />
+                                                    </div>
+                                                </td>
+                                            </tr>
+                                        )}
+                                        </React.Fragment>
+                                    );
+                                })
+                            ) : (
+                                <tr>
+                                    <td colSpan={31 + (visibleColumns.float ? 1 : 0) + (visibleColumns.power ? 1 : 0) + (visibleColumns.volume ? 1 : 0) + (visibleColumns.earnings ? 1 : 0)} className="px-4 py-32 text-center text-zinc-600 italic">
+                                        <div className="flex flex-col items-center gap-2">
+                                            <AlertCircle className="w-6 h-6 opacity-20" />
+                                            <span>{data.length === 0 ? "No data available. Run a Full Sync on Market Summary first." : "No stocks match your filter criteria."}</span>
+                                        </div>
+                                    </td>
+                                </tr>
+                            )}
+                        </tbody>
+                    </table>
+
+                    {/* Mobile Card View */}
+                    <div className="lg:hidden space-y-2 p-2">
+                        {paginatedData.length > 0 ? (
+                            paginatedData.map((row, idx) => {
+                                const rank = (currentPage - 1) * pageSize + idx + 1;
+                                const typeConfig = TRADE_TYPE_CONFIG[row.trade_type] || TRADE_TYPE_CONFIG['—'];
+                                const conflConfig = CONFLUENCE_CONFIG[row.confluence_status] || CONFLUENCE_CONFIG['NONE'];
+
+                                return (
+                                    <div
+                                        key={row.symbol}
+                                        onClick={() => setSelectedTicker(row.symbol)}
+                                        className="bg-zinc-900/50 border border-zinc-800 rounded-lg p-3 space-y-2 active:bg-zinc-800/50 transition-colors cursor-pointer"
+                                    >
+                                        {/* Header: Rank, Symbol, Type */}
+                                        <div className="flex items-center justify-between">
+                                            <div className="flex items-center gap-2">
+                                                <span className="text-zinc-600 text-xs font-mono">#{rank}</span>
+                                                <span className="text-blue-300 font-black text-base tracking-tight">{row.symbol}</span>
+                                                <span className={cn(
+                                                    "text-[10px] font-bold px-1.5 py-0.5 rounded border",
+                                                    typeConfig.bg, typeConfig.color
+                                                )}>
+                                                    {typeConfig.label}
+                                                </span>
+                                            </div>
+                                            <div className="flex items-center gap-1">
+                                                {row.data_source_conflict && <span className="text-xs">⚠️</span>}
+                                                {(row.volume_confirmation_multiplier ?? 0) > 1 && (
+                                                    <span className="text-[10px] text-cyan-400 font-bold">✓{row.volume_confirmation_multiplier?.toFixed(1)}x</span>
+                                                )}
+                                            </div>
+                                        </div>
+
+                                        {/* Score Bar */}
+                                        <div className="flex items-center gap-2">
+                                            <ScoreBar score={row.combined_score ?? row.total_score} max={row.max_combined_score ?? MAX_COMBINED_SCORE} />
+                                            {(row.deep_score ?? 0) > 0 && (
+                                                <span className={cn(
+                                                    "text-xs font-bold tabular-nums shrink-0",
+                                                    (row.deep_score ?? 0) >= 40 ? 'text-amber-400' :
+                                                    (row.deep_score ?? 0) >= 20 ? 'text-blue-400' : 'text-zinc-500'
+                                                )}>
+                                                    +{row.deep_score}
+                                                </span>
+                                            )}
+                                        </div>
+
+                                        {/* Key Metrics Grid */}
+                                        <div className="grid grid-cols-4 gap-2 text-xs">
+                                            {/* Price */}
+                                            <div className="text-center">
+                                                <div className="text-[10px] text-zinc-500">Price</div>
+                                                <div className="font-bold text-zinc-300">
+                                                    {row.price > 0 ? row.price.toLocaleString('id-ID') : '—'}
+                                                </div>
+                                                {row.pct_1d !== 0 ? (
+                                                    <div className={cn(
+                                                        "text-[10px] font-bold",
+                                                        row.pct_1d > 0 ? 'text-emerald-400' : 'text-red-400'
+                                                    )}>
+                                                        {row.pct_1d > 0 ? '+' : ''}{row.pct_1d.toFixed(1)}%
+                                                    </div>
+                                                ) : <div className="text-[10px] text-zinc-700">0%</div>}
+                                            </div>
+
+                                            {/* Confluence */}
+                                            <div className="text-center">
+                                                <div className="text-[10px] text-zinc-500">Flow</div>
+                                                <div className={cn("text-sm font-bold tracking-widest", conflConfig.color)}>
+                                                    {conflConfig.label}
+                                                </div>
+                                                <div className="text-[10px] text-zinc-600 truncate">
+                                                    {row.positive_methods.slice(0, 2).join(', ')}
+                                                </div>
+                                            </div>
+
+                                            {/* Daily Flow */}
+                                            <div className="text-center">
+                                                <div className="text-[10px] text-zinc-500">D-0 MM</div>
+                                                <div className={cn(
+                                                    "font-bold tabular-nums",
+                                                    (row.d_0_mm ?? 0) > 0 ? 'text-emerald-400' : (row.d_0_mm ?? 0) < 0 ? 'text-red-400' : 'text-zinc-600'
+                                                )}>
+                                                    {(row.d_0_mm ?? 0) > 0 ? '+' : ''}{row.d_0_mm?.toFixed(1) || '—'}
+                                                </div>
+                                                <div className="text-[10px] text-zinc-600">{row.ma_above_count}/5 MA</div>
+                                            </div>
+
+                                            {/* Inventory */}
+                                            <div className="text-center">
+                                                <div className="text-[10px] text-zinc-500">Inv</div>
+                                                {(row.inv_accum_brokers ?? 0) > 0 ? (
+                                                    <div className="text-xs font-bold">
+                                                        <span className="text-emerald-400">{row.inv_accum_brokers}A</span>
+                                                    </div>
+                                                ) : <div className="text-zinc-700">—</div>}
+                                                <div className="text-[10px] flex justify-center gap-1">
+                                                    {row.pinky && <span className="text-pink-400">PK</span>}
+                                                    {row.crossing && <span className="text-pink-400">CR</span>}
+                                                    {row.unusual && <span className="text-pink-400">UN</span>}
+                                                    {row.likuid && <span className="text-pink-400">LQ</span>}
+                                                </div>
+                                            </div>
+                                        </div>
+
+                                        {/* Cumulative Flows */}
+                                        <div className="flex justify-between text-xs border-t border-zinc-800 pt-2">
+                                            <div className="flex gap-3">
+                                                <span className="text-zinc-500">MM: <span className={cn(
+                                                    "font-bold",
+                                                    (row.txn_mm_cum ?? 0) > 0 ? 'text-emerald-400' : (row.txn_mm_cum ?? 0) < 0 ? 'text-red-400' : 'text-zinc-600'
+                                                )}>{(row.txn_mm_cum ?? 0) > 0 ? '+' : ''}{row.txn_mm_cum?.toFixed(0) || '—'}</span></span>
+                                                <span className="text-zinc-500">FF: <span className={cn(
+                                                    "font-bold",
+                                                    (row.txn_foreign_cum ?? 0) > 0 ? 'text-emerald-400' : (row.txn_foreign_cum ?? 0) < 0 ? 'text-red-400' : 'text-zinc-600'
+                                                )}>{(row.txn_foreign_cum ?? 0) > 0 ? '+' : ''}{row.txn_foreign_cum?.toFixed(0) || '—'}</span></span>
+                                            </div>
+                                            <div className="flex gap-2 text-[10px]">
+                                                <span className="text-emerald-400 font-bold">{row.top_buyer || '—'}</span>
+                                                <span className="text-zinc-600">/</span>
+                                                <span className="text-red-400 font-bold">{row.top_seller || '—'}</span>
+                                            </div>
+                                        </div>
+
+                                        {/* Yahoo Finance Data */}
+                                        {(visibleColumns.float || visibleColumns.power || visibleColumns.volume || visibleColumns.earnings) &&
+                                         (row.yahoo_finance?.float_control_pct || row.yahoo_finance?.power_score || row.yahoo_finance?.volume_ratio || row.yahoo_finance?.days_to_earnings) && (
+                                            <div className="flex flex-wrap gap-2 text-xs border-t border-zinc-800/50 pt-2">
+                                                {visibleColumns.float && row.yahoo_finance?.float_control_pct != null && (
+                                                    <div className="flex items-center gap-1">
+                                                        <span className="text-[10px] text-zinc-500">Float:</span>
+                                                        <FloatCell data={row.yahoo_finance} />
+                                                    </div>
+                                                )}
+                                                {visibleColumns.power && row.yahoo_finance?.power_score != null && (
+                                                    <div className="flex items-center gap-1">
+                                                        <span className="text-[10px] text-zinc-500">Power:</span>
+                                                        <PowerCell data={row.yahoo_finance} />
+                                                    </div>
+                                                )}
+                                                {visibleColumns.volume && row.yahoo_finance?.volume_ratio != null && (
+                                                    <div className="flex items-center gap-1">
+                                                        <span className="text-[10px] text-zinc-500">Vol:</span>
+                                                        <VolumeCell data={row.yahoo_finance} />
+                                                    </div>
+                                                )}
+                                                {visibleColumns.earnings && row.yahoo_finance?.days_to_earnings != null && (
+                                                    <div className="flex items-center gap-1">
+                                                        <span className="text-[10px] text-zinc-500">Earn:</span>
+                                                        <EarningsCell data={row.yahoo_finance} />
+                                                    </div>
+                                                )}
+                                            </div>
+                                        )}
+                                    </div>
+                                );
+                            })
+                        ) : (
+                            <div className="px-4 py-16 text-center text-zinc-600 italic">
+                                <div className="flex flex-col items-center gap-2">
+                                    <AlertCircle className="w-6 h-6 opacity-20" />
+                                    <span>{data.length === 0 ? "No data available. Run a Full Sync on Market Summary first." : "No stocks match your filter criteria."}</span>
+                                </div>
+                            </div>
+                        )}
+                    </div>
+                </div>
+            </div>
+
+            {/* Footer */}
+            <div className="bg-[#181a1f] border-t border-zinc-800 px-2 lg:px-3 py-1.5 lg:py-1 text-[9px] text-zinc-500 flex flex-wrap justify-between items-center select-none gap-2">
+                <div className="flex gap-2 lg:gap-4 items-center order-2 lg:order-1">
+                    <span className="hidden sm:inline">Showing {paginatedData.length} of {processedData.length} stocks</span>
+                    <span className="sm:hidden">{paginatedData.length}/{processedData.length}</span>
+                    {error && <span className="text-red-500 flex items-center gap-1 font-bold"><AlertCircle className="w-3 h-3" /> <span className="hidden sm:inline">{error}</span></span>}
+                </div>
+
+                {/* Pagination */}
+                <div className="flex items-center gap-1 order-1 lg:order-2 w-full lg:w-auto justify-center">
+                    <button
+                        onClick={() => setCurrentPage(p => Math.max(1, p - 1))}
+                        disabled={currentPage === 1}
+                        className="px-2 lg:px-1.5 py-1 lg:py-0.5 bg-zinc-800 rounded hover:bg-zinc-700 disabled:opacity-30 disabled:cursor-not-allowed text-zinc-300 text-[10px] lg:text-[8px]"
+                    >
+                        Prev
+                    </button>
+                    <span className="text-zinc-400 text-[10px] lg:text-[8px] mx-2 lg:mx-1">Page {currentPage} of {totalPages || 1}</span>
+                    <button
+                        onClick={() => setCurrentPage(p => Math.min(totalPages, p + 1))}
+                        disabled={currentPage === totalPages || totalPages === 0}
+                        className="px-2 lg:px-1.5 py-1 lg:py-0.5 bg-zinc-800 rounded hover:bg-zinc-700 disabled:opacity-30 disabled:cursor-not-allowed text-zinc-300 text-[10px] lg:text-[8px]"
+                    >
+                        Next
+                    </button>
+                </div>
+
+                <button
+                    onClick={handleExportCSV}
+                    className="hidden sm:flex items-center gap-1 opacity-50 hover:opacity-100 transition-opacity cursor-pointer text-[8px] order-3"
+                >
+                    <Download className="w-2.5 h-2.5" /> Export CSV
+                </button>
+            </div>
+        </div>
+
+        {/* Stock Detail Modal */}
+        <StockDetailModal
+            ticker={selectedTicker}
+            date={analysisDate || undefined}
+            onClose={() => setSelectedTicker(null)}
+        />
+        </>
+    );
+}

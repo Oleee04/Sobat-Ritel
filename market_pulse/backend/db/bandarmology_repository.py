@@ -1,0 +1,621 @@
+"""Repository for Bandarmology deep analysis data (inventory, transaction chart, cache)."""
+import json
+import logging
+import sqlite3
+from typing import Optional, List, Dict
+from datetime import datetime
+from .connection import BaseRepository
+
+logger = logging.getLogger(__name__)
+
+
+class BandarmologyRepository(BaseRepository):
+    """Repository for bandarmology inventory, transaction chart, and deep analysis cache."""
+
+    # ==================== INVENTORY ====================
+
+    def save_inventory_batch(self, ticker: str, brokers: List[Dict], date_start: str, date_end: str):
+        """Save inventory broker data for a ticker."""
+        conn = self._get_conn()
+        try:
+            scraped_at = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+            # Delete existing data for this ticker+date_end
+            conn.execute(
+                "DELETE FROM bandarmology_inventory WHERE UPPER(ticker) = UPPER(?) AND date_end = ?",
+                (ticker, date_end)
+            )
+
+            query = """
+            INSERT INTO bandarmology_inventory (
+                ticker, broker_code, is_clean, is_tektok, is_accumulating,
+                final_net_lot, start_net_lot, data_points,
+                time_series_json, date_start, date_end, scraped_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """
+
+            rows = []
+            for b in brokers:
+                # Only store last 10 points of time series to save space
+                ts = b.get('timeSeries', [])
+                ts_compact = ts[-10:] if len(ts) > 10 else ts
+
+                rows.append((
+                    ticker.upper(),
+                    b.get('code', ''),
+                    1 if b.get('isClean') else 0,
+                    1 if b.get('isTektok') else 0,
+                    1 if b.get('isAccumulating') else 0,
+                    b.get('finalNetLot', 0),
+                    b.get('startNetLot', 0),
+                    b.get('dataPoints', 0),
+                    json.dumps(ts_compact),
+                    date_start,
+                    date_end,
+                    scraped_at
+                ))
+
+            if rows:
+                conn.executemany(query, rows)
+                conn.commit()
+                logger.info(f"Saved {len(rows)} inventory records for {ticker}")
+        except Exception as e:
+            logger.error(f"Error saving inventory for {ticker}: {e}")
+            conn.rollback()
+        finally:
+            conn.close()
+
+    def get_inventory(self, ticker: str, date_end: Optional[str] = None) -> List[Dict]:
+        """Get inventory data for a ticker."""
+        conn = self._get_conn()
+        try:
+            if date_end:
+                query = """
+                SELECT * FROM bandarmology_inventory
+                WHERE UPPER(ticker) = UPPER(?) AND date_end = ?
+                ORDER BY final_net_lot DESC
+                """
+                cursor = conn.cursor()
+                cursor.execute(query, (ticker, date_end))
+            else:
+                # Get latest
+                query = """
+                SELECT * FROM bandarmology_inventory
+                WHERE UPPER(ticker) = UPPER(?)
+                ORDER BY date_end DESC, final_net_lot DESC
+                """
+                cursor = conn.cursor()
+                cursor.execute(query, (ticker,))
+
+            columns = [desc[0] for desc in cursor.description]
+            rows = cursor.fetchall()
+
+            if not rows:
+                return []
+
+            # Group by date_end (return only latest set)
+            target_date = rows[0][columns.index('date_end')]
+            result = []
+            for row in rows:
+                d = dict(zip(columns, row))
+                if d['date_end'] != target_date:
+                    break
+                d['time_series'] = json.loads(d.get('time_series_json') or '[]')
+                result.append(d)
+
+            return result
+        finally:
+            conn.close()
+
+    # ==================== TRANSACTION CHART ====================
+
+    def save_transaction_chart(self, ticker: str, data: Dict):
+        """Save transaction chart data for a ticker."""
+        conn = self._get_conn()
+        try:
+            scraped_at = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            period = data.get('period', '6m')
+            date_end = data.get('lastDate', '')
+            date_start = data.get('firstDate', '')
+            data_points = data.get('dataPoints', 0)
+
+            cum = data.get('cumulative', {})
+            daily = data.get('daily', {})
+            part = data.get('participation', {})
+            ci = data.get('cross_index', {})
+
+            # Compute trends
+            def compute_trend(method_data):
+                if not method_data:
+                    return 'NEUTRAL'
+                latest = method_data.get('latest', 0)
+                week_ago = method_data.get('week_ago', 0)
+                month_ago = method_data.get('month_ago', 0)
+                if latest > week_ago > month_ago and latest > 0:
+                    return 'STRONG_UP'
+                elif latest > week_ago and latest > 0:
+                    return 'UP'
+                elif latest < week_ago < month_ago and latest < 0:
+                    return 'STRONG_DOWN'
+                elif latest < week_ago:
+                    return 'DOWN'
+                return 'NEUTRAL'
+
+            mm_trend = compute_trend(cum.get('market_maker'))
+            foreign_trend = compute_trend(cum.get('foreign'))
+            institution_trend = compute_trend(cum.get('institution'))
+
+            # Delete existing
+            conn.execute(
+                "DELETE FROM bandarmology_txn_chart WHERE UPPER(ticker) = UPPER(?) AND period = ? AND date_end = ?",
+                (ticker, period, date_end)
+            )
+
+            # Store compact time series (dates + cumulative values only)
+            ts_json = json.dumps({
+                'dates': data.get('dates', [])[-30:],  # last 30 dates
+                'cumulative': {k: {'latest': v.get('latest', 0), 'week_ago': v.get('week_ago', 0), 'month_ago': v.get('month_ago', 0)} for k, v in cum.items()},
+                'daily': {k: {'latest': v.get('latest', 0)} for k, v in daily.items()}
+            })
+
+            conn.execute("""
+                INSERT INTO bandarmology_txn_chart (
+                    ticker, period,
+                    cum_mm, cum_nr, cum_smart, cum_retail, cum_foreign, cum_institution, cum_zombie,
+                    daily_mm, daily_nr, daily_smart, daily_retail, daily_foreign, daily_institution, daily_zombie,
+                    part_foreign, part_retail, part_institution, part_zombie,
+                    cross_index,
+                    mm_trend, foreign_trend, institution_trend,
+                    cum_mm_week_ago, cum_foreign_week_ago, cum_institution_week_ago,
+                    cum_smart_week_ago, cum_retail_week_ago,
+                    cum_mm_month_ago, cum_foreign_month_ago, cum_institution_month_ago,
+                    cum_smart_month_ago, cum_retail_month_ago,
+                    time_series_json, date_start, date_end, data_points, scraped_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                ticker.upper(), period,
+                cum.get('market_maker', {}).get('latest', 0),
+                cum.get('non_retail', {}).get('latest', 0),
+                cum.get('smart_money', {}).get('latest', 0),
+                cum.get('retail', {}).get('latest', 0),
+                cum.get('foreign', {}).get('latest', 0),
+                cum.get('institution', {}).get('latest', 0),
+                cum.get('zombie', {}).get('latest', 0),
+                daily.get('market_maker', {}).get('latest', 0),
+                daily.get('non_retail', {}).get('latest', 0),
+                daily.get('smart_money', {}).get('latest', 0),
+                daily.get('retail', {}).get('latest', 0),
+                daily.get('foreign', {}).get('latest', 0),
+                daily.get('institution', {}).get('latest', 0),
+                daily.get('zombie', {}).get('latest', 0),
+                part.get('foreign', {}).get('latest', 0),
+                part.get('retail', {}).get('latest', 0),
+                part.get('institution', {}).get('latest', 0),
+                part.get('zombie', {}).get('latest', 0),
+                ci.get('latest', 0) if ci else 0,
+                mm_trend, foreign_trend, institution_trend,
+                # Week-ago values
+                cum.get('market_maker', {}).get('week_ago', 0),
+                cum.get('foreign', {}).get('week_ago', 0),
+                cum.get('institution', {}).get('week_ago', 0),
+                cum.get('smart_money', {}).get('week_ago', 0),
+                cum.get('retail', {}).get('week_ago', 0),
+                # Month-ago values
+                cum.get('market_maker', {}).get('month_ago', 0),
+                cum.get('foreign', {}).get('month_ago', 0),
+                cum.get('institution', {}).get('month_ago', 0),
+                cum.get('smart_money', {}).get('month_ago', 0),
+                cum.get('retail', {}).get('month_ago', 0),
+                ts_json, date_start, date_end, data_points, scraped_at
+            ))
+            conn.commit()
+            logger.info(f"Saved transaction chart for {ticker}")
+        except Exception as e:
+            logger.error(f"Error saving transaction chart for {ticker}: {e}")
+            conn.rollback()
+        finally:
+            conn.close()
+
+    def get_transaction_chart(self, ticker: str, period: str = '6m') -> Optional[Dict]:
+        """Get transaction chart data for a ticker."""
+        conn = self._get_conn()
+        try:
+            query = """
+            SELECT * FROM bandarmology_txn_chart
+            WHERE UPPER(ticker) = UPPER(?) AND period = ?
+            ORDER BY date_end DESC LIMIT 1
+            """
+            cursor = conn.cursor()
+            cursor.execute(query, (ticker, period))
+            columns = [desc[0] for desc in cursor.description]
+            row = cursor.fetchone()
+            if not row:
+                return None
+            return dict(zip(columns, row))
+        finally:
+            conn.close()
+
+    # ==================== DEEP ANALYSIS CACHE ====================
+
+    def save_deep_cache(self, ticker: str, analysis_date: str, data: Dict):
+        """Save deep analysis cache for a ticker."""
+        conn = self._get_conn()
+        try:
+            conn.execute(
+                "DELETE FROM bandarmology_deep_cache WHERE UPPER(ticker) = UPPER(?) AND analysis_date = ?",
+                (ticker, analysis_date)
+            )
+
+            conn.execute("""
+                INSERT INTO bandarmology_deep_cache (
+                    ticker, analysis_date,
+                    inv_accum_brokers, inv_distrib_brokers, inv_clean_brokers, inv_tektok_brokers,
+                    inv_total_accum_lot, inv_total_distrib_lot, inv_top_accum_broker, inv_top_accum_lot,
+                    txn_mm_cum, txn_foreign_cum, txn_institution_cum, txn_retail_cum,
+                    txn_cross_index, txn_foreign_participation, txn_institution_participation,
+                    txn_mm_trend, txn_foreign_trend,
+                    broksum_total_buy_lot, broksum_total_sell_lot,
+                    broksum_total_buy_val, broksum_total_sell_val,
+                    broksum_avg_buy_price, broksum_avg_sell_price,
+                    broksum_floor_price, broksum_target_price,
+                    broksum_top_buyers_json, broksum_top_sellers_json,
+                    broksum_net_institutional, broksum_net_foreign,
+                    entry_price, target_price, stop_loss, risk_reward_ratio,
+                    controlling_brokers_json, accum_start_date, accum_phase,
+                    bandar_avg_cost, bandar_total_lot, coordination_score,
+                    phase_confidence, breakout_signal,
+                    bandar_peak_lot, bandar_distribution_pct, distribution_alert,
+                    bandar_buy_today_count, bandar_sell_today_count,
+                    bandar_buy_today_lot, bandar_sell_today_lot, bandar_confirmation,
+                    broksum_days_analyzed, broksum_consistency_score,
+                    broksum_consistent_buyers_json, broksum_consistent_sellers_json,
+                    breakout_probability, breakout_factors_json,
+                    accum_duration_days,
+                    concentration_broker, concentration_pct, concentration_risk,
+                    txn_smart_money_cum, txn_retail_cum_deep, smart_retail_divergence,
+                    volume_score, volume_signal, volume_confirmation_multiplier,
+                    data_source_conflict, conflict_stats_json,
+                    ma_cross_signal, ma_cross_score,
+                    prev_deep_score, prev_phase, phase_transition, score_trend,
+                    flow_velocity_mm, flow_velocity_foreign, flow_velocity_institution,
+                    flow_acceleration_mm, flow_acceleration_signal, flow_velocity_score,
+                    important_dates_json, important_dates_score, important_dates_signal,
+                    pump_tomorrow_score, pump_tomorrow_signal, pump_tomorrow_factors_json,
+                    deep_score, deep_trade_type, deep_signals_json
+                ) VALUES ({})
+            """.format(', '.join(['?'] * 90)), (
+                ticker.upper(), analysis_date,
+                data.get('inv_accum_brokers', 0),
+                data.get('inv_distrib_brokers', 0),
+                data.get('inv_clean_brokers', 0),
+                data.get('inv_tektok_brokers', 0),
+                data.get('inv_total_accum_lot', 0),
+                data.get('inv_total_distrib_lot', 0),
+                data.get('inv_top_accum_broker', ''),
+                data.get('inv_top_accum_lot', 0),
+                data.get('txn_mm_cum', 0),
+                data.get('txn_foreign_cum', 0),
+                data.get('txn_institution_cum', 0),
+                data.get('txn_retail_cum', 0),
+                data.get('txn_cross_index', 0),
+                data.get('txn_foreign_participation', 0),
+                data.get('txn_institution_participation', 0),
+                data.get('txn_mm_trend', ''),
+                data.get('txn_foreign_trend', ''),
+                data.get('broksum_total_buy_lot', 0),
+                data.get('broksum_total_sell_lot', 0),
+                data.get('broksum_total_buy_val', 0),
+                data.get('broksum_total_sell_val', 0),
+                data.get('broksum_avg_buy_price', 0),
+                data.get('broksum_avg_sell_price', 0),
+                data.get('broksum_floor_price', 0),
+                data.get('broksum_target_price', 0),
+                json.dumps(data.get('broksum_top_buyers', [])),
+                json.dumps(data.get('broksum_top_sellers', [])),
+                data.get('broksum_net_institutional', 0),
+                data.get('broksum_net_foreign', 0),
+                data.get('entry_price', 0),
+                data.get('target_price', 0),
+                data.get('stop_loss', 0),
+                data.get('risk_reward_ratio', 0),
+                json.dumps(data.get('controlling_brokers', [])),
+                data.get('accum_start_date', ''),
+                data.get('accum_phase', 'UNKNOWN'),
+                data.get('bandar_avg_cost', 0),
+                data.get('bandar_total_lot', 0),
+                data.get('coordination_score', 0),
+                data.get('phase_confidence', 'LOW'),
+                data.get('breakout_signal', 'NONE'),
+                data.get('bandar_peak_lot', 0),
+                data.get('bandar_distribution_pct', 0.0),
+                data.get('distribution_alert', 'NONE'),
+                data.get('bandar_buy_today_count', 0),
+                data.get('bandar_sell_today_count', 0),
+                data.get('bandar_buy_today_lot', 0),
+                data.get('bandar_sell_today_lot', 0),
+                data.get('bandar_confirmation', 'NONE'),
+                data.get('broksum_days_analyzed', 0),
+                data.get('broksum_consistency_score', 0),
+                json.dumps(data.get('broksum_consistent_buyers', [])),
+                json.dumps(data.get('broksum_consistent_sellers', [])),
+                data.get('breakout_probability', 0),
+                json.dumps(data.get('breakout_factors', {})),
+                data.get('accum_duration_days', 0),
+                data.get('concentration_broker', ''),
+                data.get('concentration_pct', 0.0),
+                data.get('concentration_risk', 'NONE'),
+                data.get('txn_smart_money_cum', 0),
+                data.get('txn_retail_cum_deep', 0),
+                data.get('smart_retail_divergence', 0),
+                data.get('volume_score', 0),
+                data.get('volume_signal', 'NONE'),
+                data.get('volume_confirmation_multiplier', 1.0),
+                1 if data.get('data_source_conflict', False) else 0,
+                json.dumps(data.get('conflict_stats')) if data.get('conflict_stats') is not None else None,
+                data.get('ma_cross_signal', 'NONE'),
+                data.get('ma_cross_score', 0),
+                data.get('prev_deep_score', 0),
+                data.get('prev_phase', ''),
+                data.get('phase_transition', 'NONE'),
+                data.get('score_trend', 'NONE'),
+                data.get('flow_velocity_mm', 0),
+                data.get('flow_velocity_foreign', 0),
+                data.get('flow_velocity_institution', 0),
+                data.get('flow_acceleration_mm', 0),
+                data.get('flow_acceleration_signal', 'NONE'),
+                data.get('flow_velocity_score', 0),
+                json.dumps(data.get('important_dates', [])),
+                data.get('important_dates_score', 0),
+                data.get('important_dates_signal', 'NONE'),
+                data.get('pump_tomorrow_score', 0),
+                data.get('pump_tomorrow_signal', 'NONE'),
+                json.dumps(data.get('pump_tomorrow_factors', {})),
+                data.get('deep_score', 0),
+                data.get('deep_trade_type', ''),
+                json.dumps(data.get('deep_signals', {}))
+            ))
+            conn.commit()
+            logger.info(f"Saved deep cache for {ticker} on {analysis_date}")
+        except Exception as e:
+            logger.error(f"Error saving deep cache for {ticker}: {e}")
+            conn.rollback()
+        finally:
+            conn.close()
+
+    def get_deep_cache(self, ticker: str, analysis_date: Optional[str] = None) -> Optional[Dict]:
+        """Get deep analysis cache for a ticker."""
+        conn = self._get_conn()
+        try:
+            if analysis_date:
+                query = """
+                SELECT * FROM bandarmology_deep_cache
+                WHERE UPPER(ticker) = UPPER(?) AND analysis_date = ?
+                """
+                cursor = conn.cursor()
+                cursor.execute(query, (ticker, analysis_date))
+            else:
+                query = """
+                SELECT * FROM bandarmology_deep_cache
+                WHERE UPPER(ticker) = UPPER(?)
+                ORDER BY analysis_date DESC LIMIT 1
+                """
+                cursor = conn.cursor()
+                cursor.execute(query, (ticker,))
+
+            columns = [desc[0] for desc in cursor.description]
+            row = cursor.fetchone()
+            if not row:
+                return None
+            d = dict(zip(columns, row))
+            d['deep_signals'] = json.loads(d.get('deep_signals_json') or '{}')
+            d['broksum_top_buyers'] = json.loads(d.get('broksum_top_buyers_json') or '[]')
+            d['broksum_top_sellers'] = json.loads(d.get('broksum_top_sellers_json') or '[]')
+            d['controlling_brokers'] = json.loads(d.get('controlling_brokers_json') or '[]')
+            d['broksum_consistent_buyers'] = json.loads(d.get('broksum_consistent_buyers_json') or '[]')
+            d['broksum_consistent_sellers'] = json.loads(d.get('broksum_consistent_sellers_json') or '[]')
+            d['breakout_factors'] = json.loads(d.get('breakout_factors_json') or '{}')
+            d['important_dates'] = json.loads(d.get('important_dates_json') or '[]')
+            d['pump_tomorrow_factors'] = json.loads(d.get('pump_tomorrow_factors_json') or '{}')
+            d['data_source_conflict'] = bool(d.get('data_source_conflict', 0))
+            d['conflict_stats'] = json.loads(d.get('conflict_stats_json') or 'null')
+            return d
+        finally:
+            conn.close()
+
+    def get_previous_deep_cache(self, ticker: str, before_date: str) -> Optional[Dict]:
+        """Get the most recent deep cache for a ticker BEFORE the given date."""
+        conn = self._get_conn()
+        try:
+            query = """
+            SELECT * FROM bandarmology_deep_cache
+            WHERE UPPER(ticker) = UPPER(?) AND analysis_date < ?
+            ORDER BY analysis_date DESC LIMIT 1
+            """
+            cursor = conn.cursor()
+            cursor.execute(query, (ticker, before_date))
+            columns = [desc[0] for desc in cursor.description]
+            row = cursor.fetchone()
+            if not row:
+                return None
+            d = dict(zip(columns, row))
+            d['deep_signals'] = json.loads(d.get('deep_signals_json') or '{}')
+            d['broksum_top_buyers'] = json.loads(d.get('broksum_top_buyers_json') or '[]')
+            d['broksum_top_sellers'] = json.loads(d.get('broksum_top_sellers_json') or '[]')
+            d['controlling_brokers'] = json.loads(d.get('controlling_brokers_json') or '[]')
+            d['broksum_consistent_buyers'] = json.loads(d.get('broksum_consistent_buyers_json') or '[]')
+            d['broksum_consistent_sellers'] = json.loads(d.get('broksum_consistent_sellers_json') or '[]')
+            d['breakout_factors'] = json.loads(d.get('breakout_factors_json') or '{}')
+            d['important_dates'] = json.loads(d.get('important_dates_json') or '[]')
+            d['pump_tomorrow_factors'] = json.loads(d.get('pump_tomorrow_factors_json') or '{}')
+            d['data_source_conflict'] = bool(d.get('data_source_conflict', 0))
+            d['conflict_stats'] = json.loads(d.get('conflict_stats_json') or 'null')
+            return d
+        finally:
+            conn.close()
+
+    def get_deep_cache_batch(self, analysis_date: str) -> Dict[str, Dict]:
+        """Get all deep analysis caches for a given date."""
+        conn = self._get_conn()
+        try:
+            query = """
+            SELECT * FROM bandarmology_deep_cache
+            WHERE analysis_date = ?
+            """
+            cursor = conn.cursor()
+            cursor.execute(query, (analysis_date,))
+            columns = [desc[0] for desc in cursor.description]
+            rows = cursor.fetchall()
+
+            result = {}
+            for row in rows:
+                d = dict(zip(columns, row))
+                d['deep_signals'] = json.loads(d.get('deep_signals_json') or '{}')
+                d['broksum_top_buyers'] = json.loads(d.get('broksum_top_buyers_json') or '[]')
+                d['broksum_top_sellers'] = json.loads(d.get('broksum_top_sellers_json') or '[]')
+                d['controlling_brokers'] = json.loads(d.get('controlling_brokers_json') or '[]')
+                d['broksum_consistent_buyers'] = json.loads(d.get('broksum_consistent_buyers_json') or '[]')
+                d['broksum_consistent_sellers'] = json.loads(d.get('broksum_consistent_sellers_json') or '[]')
+                d['breakout_factors'] = json.loads(d.get('breakout_factors_json') or '{}')
+                d['important_dates'] = json.loads(d.get('important_dates_json') or '[]')
+                d['pump_tomorrow_factors'] = json.loads(d.get('pump_tomorrow_factors_json') or '{}')
+                d['data_source_conflict'] = bool(d.get('data_source_conflict', 0))
+                d['conflict_stats'] = json.loads(d.get('conflict_stats_json') or 'null')
+                result[d['ticker']] = d
+            return result
+        finally:
+            conn.close()
+
+    def delete_deep_cache(self, ticker: str, analysis_date: str) -> bool:
+        """Delete deep analysis cache for a specific ticker and date."""
+        conn = self._get_conn()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                DELETE FROM bandarmology_deep_cache
+                WHERE UPPER(ticker) = UPPER(?) AND analysis_date = ?
+                """,
+                (ticker, analysis_date)
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+        finally:
+            conn.close()
+
+    def get_stock_summary(self, ticker: str) -> dict:
+        """
+        Get summary analysis for a specific ticker from bandarmology data.
+
+        Args:
+            ticker: Stock ticker symbol
+
+        Returns:
+            Dictionary with bandarmology summary data
+        """
+        conn = self._get_conn()
+        try:
+            cursor = conn.cursor()
+
+            # First try to get from deep cache (most detailed)
+            cursor.execute(
+                """SELECT * FROM bandarmology_deep_cache
+                   WHERE UPPER(ticker) = UPPER(?)
+                   ORDER BY analysis_date DESC
+                   LIMIT 1""",
+                (ticker,)
+            )
+
+            row = cursor.fetchone()
+            if row:
+                columns = [desc[0] for desc in cursor.description]
+                data = dict(zip(columns, row))
+
+                # Parse JSON fields
+                data['deep_signals'] = json.loads(data.get('deep_signals_json') or '{}')
+                data['breakout_factors'] = json.loads(data.get('breakout_factors_json') or '{}')
+
+                total_score = data.get('base_score')
+                if total_score is None:
+                    total_score = data.get('total_score')
+
+                deep_score = data.get('deep_score')
+                combined_score = data.get('combined_score')
+                if combined_score is None and total_score is not None and deep_score is not None:
+                    combined_score = total_score + deep_score
+                if combined_score is None and deep_score is not None:
+                    combined_score = deep_score
+
+                # Backward/forward-compatible trade type mapping.
+                trade_type = data.get('trade_type')
+                if trade_type is None:
+                    trade_type = data.get('deep_trade_type')
+
+                return {
+                    "ticker": data.get('ticker'),
+                    "total_score": total_score,
+                    "deep_score": deep_score,
+                    "combined_score": combined_score,
+                    "max_combined_score": data.get('max_combined_score') or 250,
+                    "trade_type": trade_type,
+                    "deep_trade_type": data.get('deep_trade_type'),
+                    "accum_phase": data.get('accum_phase'),
+                    "bandar_avg_cost": data.get('bandar_avg_cost'),
+                    "price_vs_cost_pct": data.get('price_vs_cost_pct'),
+                    "breakout_signal": data.get('breakout_signal'),
+                    "distribution_alert": data.get('distribution_alert'),
+                    "pinky": data.get('pinky', False),
+                    "crossing": data.get('crossing', False),
+                    "unusual": data.get('unusual', False),
+                    "breakout_probability": data.get('breakout_probability'),
+                    "phase_confidence": data.get('phase_confidence'),
+                    "coordination_score": data.get('coordination_score'),
+                    "deep_signals": data.get('deep_signals', {})
+                }
+
+            # Fallback: try to get from screening cache (if table exists)
+            try:
+                cursor.execute(
+                    """SELECT * FROM bandarmology_screening_cache
+                       WHERE UPPER(ticker) = UPPER(?)
+                       ORDER BY date DESC
+                       LIMIT 1""",
+                    (ticker,)
+                )
+
+                row = cursor.fetchone()
+                if row:
+                    columns = [desc[0] for desc in cursor.description]
+                    data = dict(zip(columns, row))
+
+                    return {
+                        "ticker": data.get('ticker'),
+                        "total_score": data.get('total_score'),
+                        "deep_score": None,
+                        "combined_score": None,
+                        "max_combined_score": None,
+                        "trade_type": data.get('trade_type'),
+                        "deep_trade_type": None,
+                        "accum_phase": None,
+                        "bandar_avg_cost": None,
+                        "price_vs_cost_pct": None,
+                        "breakout_signal": None,
+                        "distribution_alert": None,
+                        "pinky": data.get('pinky', False),
+                        "crossing": data.get('crossing', False),
+                        "unusual": data.get('unusual', False),
+                        "breakout_probability": None,
+                        "phase_confidence": None,
+                        "coordination_score": None,
+                        "deep_signals": {}
+                    }
+            except sqlite3.OperationalError:
+                # Table doesn't exist, return empty
+                pass
+
+            return {}
+
+        except Exception as e:
+            logger.error(f"Error getting stock summary for {ticker}: {e}")
+            return {}
+        finally:
+            conn.close()

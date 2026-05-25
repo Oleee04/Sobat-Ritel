@@ -1,0 +1,49 @@
+fastapi
+uvicorn
+python-multipart
+pydantic
+pydantic-settings
+requests
+pandas
+numpy
+yfinance
+beautifulsoup4
+chromadb
+ollama
+tqdm
+pypdf
+langchain
+langchain-community
+langchain-ollama
+langchain-experimental
+langchain-chroma
+playwright
+python-dotenv
+wordcloud
+pytest
+pytest-asyncio
+plotly
+# ============================================================================
+# PyTorch Installation - CHOOSE ONE:
+# ============================================================================
+#
+# Option 1: GPU (NVIDIA CUDA 12.1) - RECOMMENDED for GTX 1050 Ti
+#   Run: pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cu121
+#   This enables 10-50x faster sentiment analysis on GPU
+#
+# Option 2: CPU-only (slower, no GPU required)
+#   Run: pip install torch==2.5.1
+#   Use this if you don't have an NVIDIA GPU
+#
+# Current configuration (GPU version):
+torch
+#
+# To verify GPU is working after installation:
+#   python -c "import torch; print(torch.cuda.is_available()); print(torch.cuda.get_device_name(0))"
+# ============================================================================
+transformers
+trafilatura
+pytz
+curl-cffi
+httpx
+apscheduler

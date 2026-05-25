@@ -1,0 +1,165 @@
+{
+  "brokers": [
+    {
+      "code": "CC",
+      "name": "Mandiri Sekuritas",
+      "category": ["institutional"]
+    },
+    {
+      "code": "NI",
+      "name": "BNI Sekuritas",
+      "category": ["institutional"]
+    },
+    {
+      "code": "OD",
+      "name": "BRI Danareksa Sekuritas",
+      "category": ["institutional"]
+    },
+    {
+      "code": "GR",
+      "name": "Panin Sekuritas Tbk.",
+      "category": ["institutional"]
+    },
+    {
+      "code": "SQ",
+      "name": "BCA Sekuritas",
+      "category": ["institutional"]
+    },
+    {
+      "code": "YU",
+      "name": "CGS International Sekuritas Indonesia",
+      "category": ["foreign", "institutional"]
+    },
+    {
+      "code": "IF",
+      "name": "Samuel Sekuritas Indonesia",
+      "category": ["institutional"]
+    },
+    {
+      "code": "DR",
+      "name": "RHB Sekuritas Indonesia",
+      "category": ["foreign", "institutional"]
+    },
+    {
+      "code": "TP",
+      "name": "OCBC Sekuritas Indonesia",
+      "category": ["foreign", "institutional"]
+    },
+    {
+      "code": "KI",
+      "name": "Ciptadana Sekuritas Asia",
+      "category": ["institutional"]
+    },
+    {
+      "code": "AK",
+      "name": "UBS Sekuritas Indonesia",
+      "category": ["foreign", "institutional"]
+    },
+    {
+      "code": "MG",
+      "name": "Semesta Indovest Sekuritas",
+      "category": ["retail"]
+    },
+    {
+      "code": "BK",
+      "name": "J.P. Morgan Sekuritas Indonesia",
+      "category": ["foreign", "institutional"]
+    },
+    {
+      "code": "CS",
+      "name": "Credit Suisse Sekuritas Indonesia",
+      "category": ["foreign", "institutional"]
+    },
+    {
+      "code": "DB",
+      "name": "Deutsche Sekuritas Indonesia",
+      "category": ["foreign", "institutional"]
+    },
+    {
+      "code": "ML",
+      "name": "Merrill Lynch Indonesia",
+      "category": ["foreign", "institutional"]
+    },
+    {
+      "code": "JP",
+      "name": "J.P. Morgan Sekuritas Indonesia",
+      "category": ["foreign", "institutional"]
+    },
+    {
+      "code": "SC",
+      "name": "IMG Sekuritas",
+      "category": ["retail"]
+    },
+    {
+      "code": "GW",
+      "name": "HSBC Sekuritas Indonesia",
+      "category": ["foreign", "institutional"]
+    },
+    {
+      "code": "BA",
+      "name": "Bahana Sekuritas",
+      "category": ["institutional"]
+    },
+    {
+      "code": "CG",
+      "name": "Citigroup Sekuritas Indonesia",
+      "category": ["foreign", "institutional"]
+    },
+    {
+      "code": "RX",
+      "name": "Macquarie Sekuritas Indonesia",
+      "category": ["foreign", "institutional"]
+    },
+    {
+      "code": "YP",
+      "name": "Mirae Asset Sekuritas Indonesia",
+      "category": ["foreign", "institutional"]
+    },
+    {
+      "code": "XL",
+      "name": "Stockbit Sekuritas Digital",
+      "category": ["retail"]
+    },
+    {
+      "code": "PD",
+      "name": "Indo Premier Sekuritas",
+      "category": ["retail", "institutional"]
+    },
+    {
+      "code": "XC",
+      "name": "Ajaib Sekuritas Asia",
+      "category": ["retail"]
+    },
+    {
+      "code": "AZ",
+      "name": "Sucor Sekuritas",
+      "category": ["institutional"]
+    },
+    {
+      "code": "KK",
+      "name": "Phillip Sekuritas Indonesia",
+      "category": ["institutional"]
+    },
+    {
+      "code": "FS",
+      "name": "Yuanta Sekuritas Indonesia",
+      "category": ["foreign", "institutional"]
+    },
+    {
+      "code": "AH",
+      "name": "Shinhan Sekuritas Indonesia",
+      "category": ["foreign", "institutional"]
+    },
+    {
+      "code": "ZP",
+      "name": "Maybank Sekuritas Indonesia",
+      "category": ["foreign", "institutional"]
+    }
+  ],
+  "categories": {
+    "institutional": "Institutional brokers - typically used by fund managers, institutions, and smart money",
+    "foreign": "Foreign brokers - international investment banks and securities firms",
+    "retail": "Retail brokers - primarily serving individual retail investors",
+    "mixed": "Mixed brokers - serving both retail and institutional clients"
+  }
+}
