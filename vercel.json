@@ -1,9 +1,24 @@
 {
   "builds": [
-    {
-      "src": "api/index.php",
-      "use": "vercel-php@0.9.0"
-    }
+    { "src": "index.php", "use": "vercel-php@0.9.0" },
+    { "src": "dashboard.php", "use": "vercel-php@0.9.0" },
+    { "src": "scanner.php", "use": "vercel-php@0.9.0" },
+    { "src": "screener.php", "use": "vercel-php@0.9.0" },
+    { "src": "screener_results.php", "use": "vercel-php@0.9.0" },
+    { "src": "technical.php", "use": "vercel-php@0.9.0" },
+    { "src": "broker.php", "use": "vercel-php@0.9.0" },
+    { "src": "bandarmology.php", "use": "vercel-php@0.9.0" },
+    { "src": "calculators.php", "use": "vercel-php@0.9.0" },
+    { "src": "news.php", "use": "vercel-php@0.9.0" },
+    { "src": "settings.php", "use": "vercel-php@0.9.0" },
+    { "src": "change_password.php", "use": "vercel-php@0.9.0" },
+    { "src": "logout.php", "use": "vercel-php@0.9.0" },
+    { "src": "register.php", "use": "vercel-php@0.9.0" },
+    { "src": "auth.php", "use": "vercel-php@0.9.0" },
+    { "src": "api_price.php", "use": "vercel-php@0.9.0" },
+    { "src": "api_screener.php", "use": "vercel-php@0.9.0" },
+    { "src": "import_csv.php", "use": "vercel-php@0.9.0" },
+    { "src": "sync_prices.php", "use": "vercel-php@0.9.0" }
   ],
   "routes": [
     {
@@ -11,8 +26,16 @@
       "dest": "/$1"
     },
     {
-      "src": "/(.*)",
-      "dest": "/api/index.php"
+      "src": "/",
+      "dest": "/index.php"
+    },
+    {
+      "src": "/([a-zA-Z0-9_]+)\\.php(.*)",
+      "dest": "/$1.php$2"
+    },
+    {
+      "src": "/([a-zA-Z0-9_]+)(\\?.*)?$",
+      "dest": "/$1.php$2"
     }
   ]
 }
