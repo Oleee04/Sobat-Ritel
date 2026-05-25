@@ -3,10 +3,10 @@
 error_reporting(E_ALL & ~E_DEPRECATED & ~E_NOTICE & ~E_WARNING);
 ini_set('display_errors', '0');
 
-$host = 'localhost';
-$user = 'root';
-$pass = ''; // Default laragon password
-$db = 'screening_saham';
+$host = $_ENV['DB_HOST'] ?? 'localhost';
+$user = $_ENV['DB_USER'] ?? 'root';
+$pass = $_ENV['DB_PASSWORD'] ?? ''; // Default laragon password
+$db = $_ENV['DB_NAME'] ?? 'screening_saham';
 
 $conn = new mysqli($host, $user, $pass, $db);
 
