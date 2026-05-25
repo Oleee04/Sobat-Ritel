@@ -1,41 +1,65 @@
 {
   "builds": [
-    { "src": "index.php", "use": "vercel-php@0.9.0" },
-    { "src": "dashboard.php", "use": "vercel-php@0.9.0" },
-    { "src": "scanner.php", "use": "vercel-php@0.9.0" },
-    { "src": "screener.php", "use": "vercel-php@0.9.0" },
+    { "src": "index.php",            "use": "vercel-php@0.9.0" },
+    { "src": "dashboard.php",        "use": "vercel-php@0.9.0" },
+    { "src": "scanner.php",          "use": "vercel-php@0.9.0" },
+    { "src": "screener.php",         "use": "vercel-php@0.9.0" },
     { "src": "screener_results.php", "use": "vercel-php@0.9.0" },
-    { "src": "technical.php", "use": "vercel-php@0.9.0" },
-    { "src": "broker.php", "use": "vercel-php@0.9.0" },
-    { "src": "bandarmology.php", "use": "vercel-php@0.9.0" },
-    { "src": "calculators.php", "use": "vercel-php@0.9.0" },
-    { "src": "news.php", "use": "vercel-php@0.9.0" },
-    { "src": "settings.php", "use": "vercel-php@0.9.0" },
-    { "src": "change_password.php", "use": "vercel-php@0.9.0" },
-    { "src": "logout.php", "use": "vercel-php@0.9.0" },
-    { "src": "register.php", "use": "vercel-php@0.9.0" },
-    { "src": "auth.php", "use": "vercel-php@0.9.0" },
-    { "src": "api_price.php", "use": "vercel-php@0.9.0" },
-    { "src": "api_screener.php", "use": "vercel-php@0.9.0" },
-    { "src": "import_csv.php", "use": "vercel-php@0.9.0" },
-    { "src": "sync_prices.php", "use": "vercel-php@0.9.0" }
+    { "src": "technical.php",        "use": "vercel-php@0.9.0" },
+    { "src": "broker.php",           "use": "vercel-php@0.9.0" },
+    { "src": "bandarmology.php",     "use": "vercel-php@0.9.0" },
+    { "src": "calculators.php",      "use": "vercel-php@0.9.0" },
+    { "src": "news.php",             "use": "vercel-php@0.9.0" },
+    { "src": "settings.php",         "use": "vercel-php@0.9.0" },
+    { "src": "change_password.php",  "use": "vercel-php@0.9.0" },
+    { "src": "logout.php",           "use": "vercel-php@0.9.0" },
+    { "src": "register.php",         "use": "vercel-php@0.9.0" },
+    { "src": "auth.php",             "use": "vercel-php@0.9.0" },
+    { "src": "api_price.php",        "use": "vercel-php@0.9.0" },
+    { "src": "api_screener.php",     "use": "vercel-php@0.9.0" },
+    { "src": "import_csv.php",       "use": "vercel-php@0.9.0" },
+    { "src": "sync_prices.php",      "use": "vercel-php@0.9.0" }
   ],
   "routes": [
     {
-      "src": "/(assets/.*)",
-      "dest": "/$1"
+      "comment": "Serve static assets (CSS, JS, images, fonts) directly from CDN",
+      "src": "^/assets/(.*)$",
+      "dest": "/assets/$1"
     },
     {
-      "src": "/",
+      "comment": "Root URL - redirect to index.php (login page)",
+      "src": "^/$",
       "dest": "/index.php"
     },
     {
-      "src": "/([a-zA-Z0-9_]+)\\.php(.*)",
+      "comment": "Allow direct .php file access with query strings (e.g. /dashboard.php?id=1)",
+      "src": "^/(index|dashboard|scanner|screener|screener_results|technical|broker|bandarmology|calculators|news|settings|change_password|logout|register|auth)\\.php$",
+      "dest": "/$1.php"
+    },
+    {
+      "comment": "Allow direct .php file access with query string parameters",
+      "src": "^/(index|dashboard|scanner|screener|screener_results|technical|broker|bandarmology|calculators|news|settings|change_password|logout|register|auth)\\.php(\\?.*)?$",
       "dest": "/$1.php$2"
     },
     {
-      "src": "/([a-zA-Z0-9_]+)(\\?.*)?$",
+      "comment": "API endpoints (JSON responses)",
+      "src": "^/(api_price|api_screener|import_csv|sync_prices)\\.php(\\?.*)?$",
       "dest": "/$1.php$2"
+    },
+    {
+      "comment": "Clean URL routing - /dashboard -> dashboard.php",
+      "src": "^/(dashboard|scanner|screener|screener_results|technical|broker|bandarmology|calculators|news|settings|change_password|logout|register|auth)(\\?.*)?$",
+      "dest": "/$1.php$2"
+    },
+    {
+      "comment": "API clean URLs - /api_price -> api_price.php",
+      "src": "^/(api_price|api_screener|import_csv|sync_prices)(\\?.*)?$",
+      "dest": "/$1.php$2"
+    },
+    {
+      "comment": "Fallback - anything else goes to index.php (login page)",
+      "src": "^/(.*)$",
+      "dest": "/index.php"
     }
   ]
 }
